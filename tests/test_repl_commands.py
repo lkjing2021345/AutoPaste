@@ -50,8 +50,8 @@ class SaveTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "out.txt")
 
     def test_save_writes_utf8_with_mode_0600(self):
-        _, out, _ = run(f"中文\n:w {self.path}\n:q\n".encode())
-        self.assertIn("已保存", out)
+        _, _, err = run(f"中文\n:w {self.path}\n:q\n".encode())
+        self.assertIn("已保存", err)
         with open(self.path, "rb") as f:
             self.assertEqual(f.read(), "中文".encode())
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
@@ -64,28 +64,28 @@ class SaveTests(unittest.TestCase):
         os.symlink(target, link)
         with mock.patch.object(test_repl.autopaste, "countdown",
                                return_value=True):
-            _, out, _ = run(f"hacked\n:w {link}\n:q\n".encode())
-        self.assertIn("拒绝写入符号链接", out)
+            _, _, err = run(f"hacked\n:w {link}\n:q\n".encode())
+        self.assertIn("拒绝写入符号链接", err)
         with open(target, encoding="utf-8") as f:
             self.assertEqual(f.read(), "original")
 
     def test_save_refuses_directory_and_fifo(self):
         d = os.path.join(self.tmp.name, "adir")
         os.makedirs(d)
-        _, out, _ = run(f"x\n:w {d}\n:q\n".encode())
-        self.assertIn("拒绝写入非普通文件", out)
+        _, _, err = run(f"x\n:w {d}\n:q\n".encode())
+        self.assertIn("拒绝写入非普通文件", err)
         fifo = os.path.join(self.tmp.name, "fifo")
         os.mkfifo(fifo)
-        _, out, _ = run(f"x\n:w {fifo}\n:q\n".encode())
-        self.assertIn("拒绝写入非普通文件", out)
+        _, _, err = run(f"x\n:w {fifo}\n:q\n".encode())
+        self.assertIn("拒绝写入非普通文件", err)
 
     def test_save_is_atomic_when_replace_fails(self):
         with open(self.path, "w", encoding="utf-8") as f:
             f.write("original")
         with mock.patch.object(autopaste.os, "replace",
                                side_effect=OSError("boom")):
-            _, out, _ = run(f"new\n:w {self.path}\n:q\n".encode())
-        self.assertIn("已拦截", out)
+            _, _, err = run(f"new\n:w {self.path}\n:q\n".encode())
+        self.assertIn("已拦截", err)
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(f.read(), "original")
         leftovers = [n for n in os.listdir(self.tmp.name)
@@ -93,20 +93,20 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
     def test_save_without_arg_prints_usage(self):
-        _, out, _ = run(b"x\n:w\n:q\n")
-        self.assertIn("用法: :w <文件>", out)
+        _, _, err = run(b"x\n:w\n:q\n")
+        self.assertIn("用法: :w <文件>", err)
 
     def test_save_without_last_reports_no_content(self):
-        _, out, _ = run(f":w {self.path}\n:q\n".encode())
-        self.assertIn("还没有可保存的内容", out)
+        _, _, err = run(f":w {self.path}\n:q\n".encode())
+        self.assertIn("还没有可保存的内容", err)
         self.assertFalse(os.path.exists(self.path))
 
     def test_save_overwrites_regular_file(self):
         with open(self.path, "w", encoding="utf-8") as f:
             f.write("old")
         os.chmod(self.path, 0o644)
-        _, out, _ = run(f"new\n:w {self.path}\n:q\n".encode())
-        self.assertIn("已保存", out)
+        _, _, err = run(f"new\n:w {self.path}\n:q\n".encode())
+        self.assertIn("已保存", err)
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(f.read(), "new")
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)

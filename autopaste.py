@@ -336,6 +336,50 @@ class ClipboardError(Exception):
     """剪贴板读写失败（尚未按粘贴键时，调用方可降级为逐字符）。"""
 
 
+class Log:
+    """单一日志出口：所有诊断/警告/倒计时走 stderr，stdout 只放用户要的数据。
+
+    级别：quiet < normal < verbose。``err`` 仅测试注入，**不得**在 import 期
+    缓存 ``sys.stderr``（否则 ``redirect_stderr`` 失效）。
+    """
+
+    QUIET, NORMAL, VERBOSE = 0, 1, 2
+
+    def __init__(self, level: int = 1, err=None):
+        self.level = level
+        self._err = err
+
+    def _stream(self):
+        return self._err if self._err is not None else sys.stderr
+
+    def _emit(self, min_level: int, msg: str) -> None:
+        if self.level < min_level:
+            return
+        stream = self._stream()
+        stream.write(msg if msg.endswith("\n") else msg + "\n")
+        stream.flush()
+
+    def info(self, msg: str) -> None:       # normal+
+        self._emit(self.NORMAL, msg)
+
+    def detail(self, msg: str) -> None:     # verbose only
+        self._emit(self.VERBOSE, msg)
+
+    def warn(self, msg: str) -> None:       # normal+（错误同样保留）
+        self._emit(self.QUIET, "⚠  " + msg)
+
+    def error(self, msg: str) -> None:      # 永远
+        self._emit(self.QUIET, msg)
+
+
+LOG = Log()
+
+
+def set_log(level: int) -> None:
+    """原地改级别，保证测试里 patch 出来的 LOG 实例也生效。"""
+    LOG.level = level
+
+
 def _char_keysym(ch: str) -> int:
     """单个字符 -> X11 keysym（Latin-1 直接用码点，其余用 Unicode keysym）"""
     cp = ord(ch)
@@ -1831,7 +1875,7 @@ def paste_text(typer: "Typer", text: str, *, clip: Clipboard,
             try:
                 clip.write(backup)
             except Exception as e:
-                sys.stderr.write(f"⚠ 剪贴板恢复失败，原内容已丢失：{e}\n")
+                LOG.warn(f"剪贴板恢复失败，原内容已丢失：{e}")
 
 
 def send_text(typer: "Typer", text: str, *, args, target_info: dict | None,
@@ -1840,12 +1884,11 @@ def send_text(typer: "Typer", text: str, *, args, target_info: dict | None,
     clip_factory = make_clipboard if clip_factory is None else clip_factory
     clip = clip_factory()
     if clip is None:
-        sys.stderr.write(
-            "⚠  未找到 xclip/xsel/wl-copy，--paste-mode 降级为逐字符输入。"
-            "安装：sudo apt install xclip（或 wl-clipboard）\n")
+        LOG.warn("未找到 xclip/xsel/wl-copy，--paste-mode 降级为逐字符输入。"
+                 "安装：sudo apt install xclip（或 wl-clipboard）")
         est = len(text) * max(args.delay, 0.0)
         if est >= 5:
-            sys.stderr.write(f"   预计耗时约 {est:.0f} 秒（Ctrl-C 可中断）\n")
+            LOG.warn(f"预计耗时约 {est:.0f} 秒（Ctrl-C 可中断）")
         typer.type_text(text)
         return False
     info = target_info
@@ -1860,8 +1903,7 @@ def send_text(typer: "Typer", text: str, *, args, target_info: dict | None,
                    restore=not args.no_clipboard_backup,
                    wait=args.paste_wait)
     except ClipboardError as e:
-        sys.stderr.write(
-            f"⚠  剪贴板操作失败（{e}），降级为逐字符输入。\n")
+        LOG.warn(f"剪贴板操作失败（{e}），降级为逐字符输入。")
         typer.type_text(text)
         return False
     return True
@@ -2042,8 +2084,7 @@ class History:
     # ---- 安全闸门
     def _disable(self, why: str) -> None:
         self.disabled_reason = why
-        sys.stderr.write(f"⚠  {why}\n")
-        sys.stderr.flush()
+        LOG.warn(why)
 
     def _dir_problem(self, d: str) -> str | None:
         try:
@@ -2257,10 +2298,8 @@ class LineEditor:
                 overflow = True
                 break
         if overflow:
-            sys.stderr.write(
-                f"⚠ 粘贴内容超过上限 {MAX_PAYLOAD} 字节，"
-                f"已截断并丢弃剩余部分。\n")
-            sys.stderr.flush()
+            LOG.warn(f"粘贴内容超过上限 {MAX_PAYLOAD} 字节，"
+                     f"已截断并丢弃剩余部分。")
             self._discard_paste_tail(data[-5:])
             del data[MAX_PAYLOAD:]
         return (data.decode("utf-8", "replace")
@@ -2483,15 +2522,24 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True,
         target = label
     if seconds <= 0:
         return True
+    stream = LOG._stream()
+    quiet = LOG.level == Log.QUIET
+    if quiet:
+        # --quiet 只压成一行，但目标窗口与"可取消"必须保留（安全可视化）
+        tail = f"｜{int(seconds)}s 后可取消（任意键取消）" if cancelable \
+            else f"｜{int(seconds)}s 后开始"
+        stream.write(f"目标 {target}{tail}\n")
+        stream.flush()
     end = time.time() + seconds
     try:
         while True:
             left = end - time.time()
             if left <= 0:
                 break
-            tail = "（按任意键取消）" if cancelable else ""
-            sys.stdout.write(f"\r  目标 {target}  {left:4.1f}s {tail}   ")
-            sys.stdout.flush()
+            if not quiet:
+                tail = "（按任意键取消）" if cancelable else ""
+                stream.write(f"\r  目标 {target}  {left:4.1f}s {tail}   ")
+                stream.flush()
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
             if r and cancelable:
                 try:
@@ -2499,22 +2547,26 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True,
                 except OSError:
                     data = b""
                 if data:
-                    sys.stdout.write("\r" + " " * 70 + "\r  已取消\r\n")
+                    stream.write("\r" + " " * 70 + "\r  已取消\r\n"
+                                 if not quiet else "  已取消\n")
                     return False
                 # EOF（如 `cat note.txt | autopaste -s 3 -`）：stdin 再也
                 # 变不出按键，停止监听，但倒计时必须照常走完。
                 cancelable = False
     except KeyboardInterrupt:
-        sys.stdout.write("\r" + " " * 70 + "\r  已取消\r\n")
+        stream.write("\r" + " " * 70 + "\r  已取消\r\n" if not quiet
+                     else "  已取消\n")
         return False
-    sys.stdout.write("\r" + " " * 70 + "\r")
+    if not quiet:
+        stream.write("\r" + " " * 70 + "\r")
+        stream.flush()
     return True
 
 
 def warn_multiline_target(typer: Typer, text: str) -> None:
     msg = multiline_risk(typer, text)
     if msg:
-        sys.stderr.write(f"⚠  {msg}\n")
+        LOG.warn(msg)
 
 
 def _cmd_preview(typer: Typer, cfg: Settings, last: str | None) -> None:
@@ -2634,8 +2686,13 @@ def repl(typer: Typer, cfg: Settings,
     last: str | None = None
     #: 本轮提交实际激活的目标窗口（None = 不定向，敲当前焦点）
     focus_target: WindowInfo | None = None
-    sys.stdout.write(BANNER)
-    sys.stdout.flush()
+    LOG.info(BANNER)
+
+    def note_sent(text: str, started: float) -> None:
+        dt = time.time() - started
+        rate = (len(text) / dt) if dt > 0 else float("inf")
+        LOG.detail(f"已发送 {len(text)} 字符 / {_entry_lines(text)} 行，"
+                   f"用时 {dt:.2f}s（{rate:.1f} 字/秒）")
 
     def activate() -> bool:
         """REPL 里 --window 是粘性目标：每次提交前重新解析并激活。"""
@@ -2651,7 +2708,7 @@ def repl(typer: Typer, cfg: Settings,
             focus_target = target
             return True
         except Abort as e:
-            sys.stdout.write(f"  已拦截: {e}\n")
+            LOG.warn(f"已拦截: {e}")
             return False
 
     def focus_ok() -> bool:
@@ -2666,11 +2723,9 @@ def repl(typer: Typer, cfg: Settings,
         except Exception:
             ok = False
         if not ok:
-            sys.stderr.write(
-                f"  已拦截: 焦点已离开定向窗口 "
-                f"{describe_window_info(focus_target)}，已取消本次输入"
-                f"（避免敲到别处）。\n")
-            sys.stderr.flush()
+            LOG.warn(f"已拦截: 焦点已离开定向窗口 "
+                     f"{describe_window_info(focus_target)}，已取消本次输入"
+                     f"（避免敲到别处）。")
         return ok
 
     def cleanup():
@@ -2719,14 +2774,14 @@ def repl(typer: Typer, cfg: Settings,
                     elif name == "win":
                         if arg in ("-", ""):
                             cfg.window = None
-                            sys.stdout.write("  已清除定向窗口\n")
+                            LOG.info("  已清除定向窗口")
                         else:
                             cfg.window = arg
-                            sys.stdout.write(f"  定向窗口={arg}\n")
+                            LOG.info(f"  定向窗口={arg}")
                     elif name == "p":
                         _cmd_preview(typer, cfg, last)
                     elif name == "w":
-                        sys.stdout.write(_cmd_save(arg, last) + "\n")
+                        LOG.info(_cmd_save(arg, last))
                     elif name == "s":
                         cfg.sleep = _num(arg, 0.0, MAX_COUNTDOWN, "倒计时")
                     elif name == "d":
@@ -2734,8 +2789,8 @@ def repl(typer: Typer, cfg: Settings,
                         typer.delay = cfg.delay
                     elif name == "nl":
                         cfg.auto_enter = not cfg.auto_enter
-                        sys.stdout.write("  自动回车: %s\n"
-                                         % ("开" if cfg.auto_enter else "关"))
+                        LOG.info("  自动回车: %s"
+                                 % ("开" if cfg.auto_enter else "关"))
                     elif name == "k":
                         validate_payload(arg)
                         if (activate() and countdown(cfg.sleep, typer)
@@ -2750,27 +2805,31 @@ def repl(typer: Typer, cfg: Settings,
                         warn_multiline_target(typer, body)
                         if (activate() and countdown(cfg.sleep, typer)
                                 and focus_ok()):
+                            started = time.time()
                             typer.type_text(body)
+                            note_sent(body, started)
                         last = body
                     elif name == "r":
                         if last is None:
-                            sys.stdout.write("  还没有可重复的内容\n")
+                            LOG.info("  还没有可重复的内容")
                         elif (activate() and countdown(cfg.sleep, typer)
                               and focus_ok()):
+                            started = time.time()
                             typer.type_text(last)
+                            note_sent(last, started)
                     elif name == "":
                         pass
                     else:
-                        sys.stdout.write(f"  未知命令 :{name}，输入 :h 查看帮助\n")
+                        LOG.info(f"  未知命令 :{name}，输入 :h 查看帮助")
                 except (Abort, ValueError, OSError) as e:
-                    sys.stdout.write(f"  已拦截: {e}\n")
+                    LOG.warn(f"已拦截: {e}")
                 sys.stdout.flush()
                 continue
 
             try:
                 validate_payload(text)
             except Abort as e:
-                sys.stdout.write(f"  已拦截: {e}\n")
+                LOG.warn(f"已拦截: {e}")
                 continue
             if history is not None:
                 history.add(text)
@@ -2778,9 +2837,11 @@ def repl(typer: Typer, cfg: Settings,
             warn_multiline_target(typer, text)
             if (activate() and countdown(cfg.sleep, typer)
                     and focus_ok()):
+                started = time.time()
                 typer.type_text(text)
                 if cfg.auto_enter:
                     typer.press("enter")
+                note_sent(text, started)
             sys.stdout.flush()
     finally:
         try:
@@ -2788,7 +2849,7 @@ def repl(typer: Typer, cfg: Settings,
             sys.stdout.flush()
         finally:
             cleanup()
-    sys.stdout.write("bye\n")
+    LOG.info("bye")
     return 0
 
 
@@ -2892,6 +2953,11 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
     ap.add_argument("--no-clipboard-backup", "--no-restore-clipboard",
                     dest="no_clipboard_backup", action="store_true",
                     help="不备份/不恢复原剪贴板（默认 fail-closed：备份失败即停止）")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("-v", "--verbose", action="store_true",
+                   help="输出诊断信息（配置来源/后端/capabilities/耗时）")
+    g.add_argument("-q", "--quiet", action="store_true",
+                   help="静默模式：只保留倒计时目标行、风险提示与错误")
     ap.add_argument("--no-history", action="store_true",
                     help="不读写 REPL 历史文件（默认保存到 XDG state 目录）")
     ap.add_argument("--allow-root", action="store_true",
@@ -3012,6 +3078,8 @@ def format_backends(env=None, which=None, runner=None) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+    set_log(Log.VERBOSE if args.verbose else
+            Log.QUIET if args.quiet else Log.NORMAL)
 
     if args.list_backends:
         sys.stdout.write(format_backends())
@@ -3019,10 +3087,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 安全闸门 1: 不以 root 身份注入按键
     if hasattr(os, "geteuid") and os.geteuid() == 0 and not args.allow_root:
-        sys.stderr.write(
-            "拒绝以 root 运行：按键注入等同于代替你敲键盘，"
-            "以 root 执行会把任何窗口都暴露给它。\n"
-            "如确有需要，请显式加 --allow-root。\n")
+        LOG.error("拒绝以 root 运行：按键注入等同于代替你敲键盘，"
+                  "以 root 执行会把任何窗口都暴露给它。\n"
+                  "如确有需要，请显式加 --allow-root。")
         return 2
 
     # ---- --list-windows：只读枚举，不激活、不注入
@@ -3032,9 +3099,9 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 caps = typer.capabilities()
                 if not caps.get("window_control"):
-                    sys.stderr.write(
+                    LOG.error(
                         f"当前后端 {caps.get('name')} 不支持窗口枚举"
-                        f"（Wayland 看不到 X11 窗口）。请用 --backend x11。\n")
+                        f"（Wayland 看不到 X11 窗口）。请用 --backend x11。")
                     return 2
                 wins = typer.list_windows()
                 if args.window:
@@ -3051,10 +3118,10 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 typer.close()
         except BackendUnavailable as e:
-            sys.stderr.write(f"{e}\n")
+            LOG.error(f"{e}")
             return 2
         except Abort as e:
-            sys.stderr.write(f"已拦截: {e}\n")
+            LOG.error(f"已拦截: {e}")
             return e.code
 
     try:
@@ -3062,7 +3129,7 @@ def main(argv: list[str] | None = None) -> int:
         sleep = 0.0 if args.sleep is None else _num(
             str(args.sleep), 0.0, MAX_COUNTDOWN, "倒计时")
     except Abort as e:
-        sys.stderr.write(f"{e}\n")
+        LOG.error(f"{e}")
         return 1
 
     interactive = args.repl or (not args.text and not args.file
@@ -3071,14 +3138,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if interactive:
             if args.paste_mode:
-                sys.stderr.write(
-                    "--paste-mode 目前只支持命令行模式（REPL 内请用 :k 或直接粘贴）。\n")
+                LOG.error("--paste-mode 目前只支持命令行模式"
+                          "（REPL 内请用 :k 或直接粘贴）。")
                 return 1
             cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
                            delay=delay, window=args.window)
             history = None
             if not args.no_history:
                 history = History(default_history_path())
+                if history.path is not None:
+                    LOG.detail(
+                        f"历史: {history.path}（载入 {len(history.entries)} 条，"
+                        f"跳过 {history.skipped} 条损坏）")
             typer = Typer(backend=args.backend, delay=cfg.delay)
             return repl(typer, cfg, history=history)
 
@@ -3126,9 +3197,12 @@ def main(argv: list[str] | None = None) -> int:
             validate_payload(item, args.allow_control)
 
         typer = Typer(backend=args.backend, delay=delay)
+        caps = typer.capabilities()
+        LOG.detail(f"后端: {caps.get('name')} capabilities: {caps}")
+        LOG.detail(f"会话: {detect_session()}")
         if args.safe:
             typer.backend.batch_enabled = False
-        if args.paste_mode and not typer.capabilities().get("combos"):
+        if args.paste_mode and not caps.get("combos"):
             raise BackendUnavailable(
                 f"当前后端 {args.backend} 不支持组合键，无法使用 --paste-mode。")
 
@@ -3189,9 +3263,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             risk = multiline_risk(typer, joined)
         if risk:
-            sys.stderr.write(f"⚠  {risk}\n")
+            LOG.warn(risk)
             if not args.yes and not _confirm("继续？"):
-                sys.stderr.write("已取消。\n")
+                LOG.warn("已取消。")
                 return 3
 
         # ---- 激活定向窗口（改焦点是副作用，放在确认之后）
@@ -3210,19 +3284,21 @@ def main(argv: list[str] | None = None) -> int:
 
         # ---- 敲键前复核焦点：倒计时里用户可能点走了，绝不抢回
         if target is not None and not typer.is_window_focused(target.xid):
-            sys.stderr.write(
-                "焦点已离开定向窗口，已取消（避免敲到别处）。\n")
+            LOG.warn("焦点已离开定向窗口，已取消（避免敲到别处）。")
             return 3
 
         # ---- paste-mode：唯一一次剪贴板写入发生在倒计时与焦点复核之后
         if args.paste_mode:
             if args.no_clipboard_backup:
-                sys.stderr.write(
-                    "⚠  --no-clipboard-backup：不备份/不恢复剪贴板，"
-                    "原内容会被覆盖。\n")
+                LOG.warn("--no-clipboard-backup：不备份/不恢复剪贴板，"
+                         "原内容会被覆盖。")
+            started = time.time()
             send_text(typer, joined, args=args, target_info=target_info)
+            LOG.detail(f"已发送 {len(joined)} 字符 / {_entry_lines(joined)} 行，"
+                       f"用时 {time.time() - started:.2f}s（paste-mode）")
             return 0
 
+        started = time.time()
         for item in args.key:
             if len(item) == 1 or not is_combo(item):
                 if item.lower() in SPECIAL or item.lower() in MODIFIERS:
@@ -3231,21 +3307,25 @@ def main(argv: list[str] | None = None) -> int:
                     typer.type_text(item)
             else:
                 typer.press(item)
+        dt = time.time() - started
+        rate = (len(joined) / dt) if dt > 0 else float("inf")
+        LOG.detail(f"已发送 {len(joined)} 字符 / {_entry_lines(joined)} 行，"
+                   f"用时 {dt:.2f}s（{rate:.1f} 字/秒）")
         return 0
     except (WindowUnavailable, WindowCancelled) as e:
-        sys.stderr.write(f"{e}\n")
+        LOG.error(f"{e}")
         return e.code
     except BackendUnavailable as e:
-        sys.stderr.write(f"{e}\n")
+        LOG.error(f"{e}")
         return 2
     except BackendError as e:
-        sys.stderr.write(f"已拦截: {e}\n")
+        LOG.error(f"已拦截: {e}")
         return 1
     except Abort as e:
-        sys.stderr.write(f"已拦截: {e}\n")
+        LOG.error(f"已拦截: {e}")
         return e.code
     except KeyboardInterrupt:
-        sys.stderr.write("\n已中断。\n")
+        LOG.error("\n已中断。")
         return 130
 
 
@@ -3277,7 +3357,7 @@ def console_main(argv: list[str] | None = None) -> int:
         return main(argv)
     except KeyboardInterrupt:
         # main() 内部已把中断转成 130；这里兜住 argparse 等更早的位置。
-        sys.stderr.write("\n已中断。\n")
+        LOG.error("\n已中断。")
         return 130
 
 

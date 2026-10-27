@@ -30,8 +30,10 @@ class FakeTTY:
 
 
 class ReplTyper:
-    def __init__(self, *, focused=True):
+    def __init__(self, *, focused=True, focus=None):
         self.focused = focused
+        self.focus = focus or {"class": "kitty", "name": "kitty",
+                               "title": "shell"}
         self.typed = []
         self.pressed = []
         self.delay = 0.0
@@ -44,7 +46,7 @@ class ReplTyper:
                 "window_control": True}
 
     def focus_info(self):
-        return {"class": "kitty", "name": "kitty", "title": "shell"}
+        return self.focus
 
     def list_windows(self):
         return [autopaste.WindowInfo(0x200, cls="kitty", title="shell")]
@@ -129,10 +131,10 @@ class CountdownEofTests(unittest.TestCase):
         raw = self._eof_stdin()
         typer = ReplTyper()
         with mock.patch.object(autopaste.sys, "stdin", raw), \
-                redirect_std() as (out, _):
+                redirect_std() as (_, err):
             ok = autopaste.countdown(0.15, typer, cancelable=True)
         self.assertTrue(ok)
-        self.assertNotIn("已取消", out.getvalue())
+        self.assertNotIn("已取消", err.getvalue())
 
     def test_keypress_still_cancels_countdown(self):
         rfd, wfd = os.pipe()
@@ -142,10 +144,10 @@ class CountdownEofTests(unittest.TestCase):
         self.addCleanup(raw.close)
         typer = ReplTyper()
         with mock.patch.object(autopaste.sys, "stdin", raw), \
-                redirect_std() as (out, _):
+                redirect_std() as (_, err):
             ok = autopaste.countdown(5.0, typer, cancelable=True)
         self.assertFalse(ok)
-        self.assertIn("已取消", out.getvalue())
+        self.assertIn("已取消", err.getvalue())
 
 
 if __name__ == "__main__":
