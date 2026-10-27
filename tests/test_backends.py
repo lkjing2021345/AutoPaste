@@ -77,6 +77,25 @@ class ChooseBackendTests(unittest.TestCase):
                                      which=_which({"wtype", "ydotool"})),
             "wtype")
 
+    def test_auto_wayland_prefers_ydotool_on_gnome(self):
+        # mutter 不支持 virtual-keyboard，即使 wtype 已安装也必须先选 ydotool
+        env = {"XDG_SESSION_TYPE": "wayland",
+               "XDG_CURRENT_DESKTOP": "GNOME"}
+        self.assertEqual(
+            autopaste.choose_backend("auto", env=env,
+                                     which=_which({"wtype", "ydotool"}),
+                                     socket_ok=lambda e: True),
+            "ydotool")
+
+    def test_auto_gnome_falls_back_to_wtype_without_socket(self):
+        env = {"XDG_SESSION_TYPE": "wayland",
+               "XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}
+        self.assertEqual(
+            autopaste.choose_backend("auto", env=env,
+                                     which=_which({"wtype", "ydotool"}),
+                                     socket_ok=lambda e: False),
+            "wtype")
+
     def test_auto_wayland_ydotool_when_only_ydotool(self):
         env = {"XDG_SESSION_TYPE": "wayland"}
         self.assertEqual(
@@ -164,6 +183,27 @@ class WtypeArgvTests(unittest.TestCase):
         with self.assertRaises(autopaste.Abort):
             backend.press("hyper+t")
 
+    def test_super_modifier_mapped_to_logo(self):
+        backend, runner = self.make()
+        backend.press("super+l")
+        self.assertEqual(
+            runner.calls[0],
+            ["wtype", "-d", "8", "-M", "logo", "-k", "l", "-m", "logo"])
+
+    def test_meta_and_win_aliases_mapped_to_logo(self):
+        backend, runner = self.make()
+        backend.press("meta+a")
+        backend.press("win+a")
+        for call in runner.calls:
+            self.assertEqual(call[3:5], ["-M", "logo"])
+            self.assertEqual(call[-2:], ["-m", "logo"])
+
+    def test_unsupported_modifier_aborts_before_running(self):
+        backend, runner = self.make()
+        with self.assertRaises(autopaste.Abort):
+            backend.press("hyper+t")
+        self.assertEqual(runner.calls, [])
+
     def test_nonzero_exit_raises_backend_error_with_stderr(self):
         backend, _ = self.make(rc=1, stderr="failed to create virtual keyboard")
         with self.assertRaises(autopaste.BackendError) as ctx:
@@ -172,6 +212,16 @@ class WtypeArgvTests(unittest.TestCase):
         self.assertIn("1", msg)
         self.assertIn("virtual keyboard", msg)
         self.assertIn("ydotool", msg)
+
+    def test_protocol_unsupported_suggests_ydotool_backend(self):
+        backend, _ = self.make(
+            rc=1, stderr="compositor does not support the virtual keyboard protocol")
+        with self.assertRaises(autopaste.BackendError) as ctx:
+            backend.type_text("x")
+        msg = str(ctx.exception)
+        self.assertIn("--backend ydotool", msg)
+        self.assertIn("ydotoold", msg)
+        self.assertIn("不会静默重试", msg)
 
     def test_missing_binary_raises_unavailable(self):
         with self.assertRaises(autopaste.BackendUnavailable):
@@ -233,11 +283,25 @@ class YdotoolTests(unittest.TestCase):
             socket=socket)
         return backend, runner
 
-    def test_type_argv(self):
+    def test_type_argv_disables_escaping(self):
         backend, runner = self.make()
         backend.type_text("hello")
-        self.assertEqual(runner.calls[0],
-                         ["ydotool", "type", "--key-delay", "8", "--", "hello"])
+        self.assertEqual(
+            runner.calls[0],
+            ["ydotool", "type", "--key-delay", "8", "-e", "0", "--", "hello"])
+        # -e 0 必须出现在文本分隔符之前，否则会被当成文本的一部分
+        self.assertLess(runner.calls[0].index("-e"),
+                        runner.calls[0].index("--"))
+
+    def test_backslash_text_sent_literally_without_control_chars(self):
+        backend, runner = self.make()
+        # 字面反斜杠序列 + 末尾反斜杠；开启转义时会被解码/丢弃
+        text = "echo a\\nrm -rf ~\\x1b\\t\\\\"
+        backend.type_text(text)
+        self.assertEqual(runner.calls[0][-1], text)
+        self.assertEqual(runner.calls[0][-4:-2], ["-e", "0"])
+        for ch in runner.calls[0][-1]:
+            self.assertFalse(ord(ch) < 32 or ord(ch) == 127)
 
     def test_combo_uses_evdev_codes(self):
         backend, runner = self.make()

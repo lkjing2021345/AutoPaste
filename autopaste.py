@@ -165,6 +165,14 @@ MODIFIERS = {
     "super": "Super_L", "win": "Super_L", "meta": "Super_L",
 }
 
+#: wtype 的 -M/-m 只接受它自己的修饰键名（见上游 mod_names[]），
+#: 不接受 X11 的 Super_L 或 fancier 的 "super"；在发送前显式校验。
+WTYPE_MODIFIERS = {
+    "ctrl": "ctrl", "control": "ctrl",
+    "alt": "alt", "shift": "shift",
+    "super": "logo", "win": "logo", "meta": "logo",
+}
+
 KEYSYM_SHIFT = 0xFFE1  # Shift_L
 
 
@@ -568,8 +576,10 @@ class WtypeBackend(Backend):
             hint = ""
             low = err.lower()
             if any(mark in low for mark in self._PROTO_ERR):
-                hint = ("（当前合成器可能不支持 virtual-keyboard 协议；"
-                        "GNOME/mutter 请改用 --backend ydotool）")
+                hint = ("（当前合成器可能不支持 virtual-keyboard 协议，"
+                        "GNOME/mutter 就是如此。请改用 --backend ydotool："
+                        "先 systemctl --user enable --now ydotoold；"
+                        "本程序不会静默重试，避免重复输入。）")
             raise BackendError(f"wtype 失败（退出码 {rc}）：{err}{hint}")
 
     # ------------------------------------------------------------- 注入
@@ -586,11 +596,17 @@ class WtypeBackend(Backend):
             key = MODIFIERS[low]
         elif low in SPECIAL:
             key = SPECIAL[low]
-        args: list[str] = []
+        wmods: list[str] = []
         for mod in mods:
+            mapped = WTYPE_MODIFIERS.get(mod)
+            if mapped is None:  # parse_combo 已过滤，属于防御性检查
+                raise Abort(f"wtype 后端不支持修饰键 {mod!r}")
+            wmods.append(mapped)
+        args: list[str] = []
+        for mod in wmods:
             args += ["-M", mod]
         args += ["-k", key]
-        for mod in reversed(mods):
+        for mod in reversed(wmods):
             args += ["-m", mod]
         self._exec(args)
 
@@ -654,7 +670,12 @@ def _ydotool_socket_ok(env=None) -> bool:
 
 
 class YdotoolBackend(Backend):
-    """通过 ydotool（/dev/uinput）注入按键；仅支持 ASCII。"""
+    """通过 ydotool（/dev/uinput）注入按键；仅支持 ASCII 字面量。
+
+    ``ydotool type`` 默认开启反斜杠转义（``\\n``/``\\t``/``\\xNN`` 会被
+    解码成真实控制字符），因此每次调用都显式传 ``-e 0``，把文本按字面量
+    交给工具——否则会绕过 ``validate_payload`` 的控制字符拦截与多行确认。
+    """
 
     name = "ydotool"
     MAX_ARG = 32 * 1024
@@ -723,7 +744,8 @@ class YdotoolBackend(Backend):
         if not text:
             return
         for chunk in _chunks(text, self.MAX_ARG):
-            self._exec(["type", *self._delay_args(), "--", chunk])
+            # -e 0：关闭 ydotool 的反斜杠转义，文本必须按字面量发送。
+            self._exec(["type", *self._delay_args(), "-e", "0", "--", chunk])
 
     def press(self, combo: str) -> None:
         mods, key = parse_combo(combo)
@@ -795,10 +817,16 @@ def choose_backend(requested: str = "auto", env=None, which=None,
     if session == "x11":
         return "x11"
     if session == "wayland":
-        if which("wtype"):
-            return "wtype"
-        if which("ydotool") and socket_ok(env):
-            return "ydotool"
+        # mutter 不实现 virtual-keyboard 协议，GNOME 上 wtype 必然失败，
+        # 因此把 ydotool 放在前面；其他合成器仍优先无需守护进程的 wtype。
+        desktop = (env.get("XDG_CURRENT_DESKTOP") or "").upper()
+        order = ("ydotool", "wtype") if "GNOME" in desktop else \
+                ("wtype", "ydotool")
+        for name in order:
+            if name == "wtype" and which("wtype"):
+                return "wtype"
+            if name == "ydotool" and which("ydotool") and socket_ok(env):
+                return "ydotool"
     raise BackendUnavailable(_missing_hint(session))
 
 
