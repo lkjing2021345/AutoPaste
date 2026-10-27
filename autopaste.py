@@ -81,7 +81,7 @@ import time
 import tty
 import unicodedata
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ----------------------------------------------------------------- 安全常量
 MAX_PAYLOAD = 1 << 20        # 单次输入上限 1 MiB，避免误喂超大文件/管道
@@ -3274,6 +3274,8 @@ def build_parser() -> argparse.ArgumentParser:
   * 多行文本打进终端会二次确认（Wayland 下所有多行都确认）；
   * --window 会主动激活目标窗口；--paste-mode 会改写系统剪贴板（默认备份/恢复）；
   * 详见 SECURITY.md。
+
+文档: docs/cli.md（参数）、docs/backends.md（后端）、docs/usage.md（教程）。
 
 zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，或直接用 REPL 粘贴。
 """)
