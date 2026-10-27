@@ -2517,11 +2517,93 @@ def warn_multiline_target(typer: Typer, text: str) -> None:
         sys.stderr.write(f"⚠  {msg}\n")
 
 
+def _cmd_preview(typer: Typer, cfg: Settings, last: str | None) -> None:
+    """`:p`：只预览上一段内容，绝不发送任何按键。"""
+    if last is None:
+        sys.stdout.write("  还没有可预览的内容（先输入一段或 :f <文件>）\n")
+        return
+    nlines = _entry_lines(last)
+    est = len(last) * max(cfg.delay, 0.0)
+    sys.stdout.write(f"  预览（{len(last)} 字符 / {nlines} 行，"
+                     f"预计 {est:.1f}s，未发送）:\n")
+    sys.stdout.write(f"  {_esc_preview(last)}\n")
+    sys.stdout.write(f"  目标: {target_label(typer)}\n")
+    if est > 60:
+        sys.stdout.write("  提示: 预计耗时较长，可考虑 --paste-mode 或 :k ctrl+v\n")
+    risk = multiline_risk(typer, last)
+    if risk:
+        sys.stdout.write(f"  ⚠ {risk}\n")
+
+
+def _save_target(path: str) -> None:
+    """`:w` 写入前的 fail-closed 检查：只接受普通文件，拒绝符号链接。"""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return                       # 新文件：由 O_EXCL 临时文件保证不写穿
+    except OSError as e:
+        raise Abort(f"无法检查 {path}: {e}")
+    if stat.S_ISLNK(st.st_mode):
+        raise Abort(f"拒绝写入符号链接: {path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise Abort(f"拒绝写入非普通文件: {path}")
+
+
+def _cmd_save(arg: str, last: str | None) -> str:
+    """`:w <文件>`：原子写入上一段内容（0600），返回回执文本。"""
+    if not arg:
+        raise Abort("用法: :w <文件>")
+    if last is None:
+        raise Abort("还没有可保存的内容")
+    path = os.path.expanduser(arg)
+    if not os.path.basename(path) or path.endswith(os.sep):
+        raise Abort(f"无效的文件路径: {arg}")
+    _save_target(path)
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.autopaste-{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise Abort(f"无法写入 {path}: {e}")
+    try:
+        data = last.encode("utf-8")
+        while data:
+            n = os.write(fd, data)
+            if n <= 0:
+                raise OSError("写入未完成")
+            data = data[n:]
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    except OSError as e:
+        os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise Abort(f"无法写入 {path}: {e}")
+    os.close(fd)
+    try:
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise Abort(f"无法写入 {path}: {e}")
+    return (f"  已保存 {path}（{len(last)} 字符 / {_entry_lines(last)} 行，"
+            f"0600）")
+
+
 BANNER = """\
 autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任何引号/转义问题
   :s 3 倒计时 | :d 0.02 每字间隔 | :nl 自动回车 | :k 组合键 | :f 文件
-  :r 重复上次 | :t 状态/目标窗口 | :w 定向窗口 | :h 帮助 | :q 退出
-  ↑/↓ 历史（行内前缀搜索，↓ 回到草稿）
+  :r 重复上次 | :t 状态/目标窗口 | :p 预览 | :w 保存 | :win 定向窗口
+  ↑/↓ 历史（行内前缀搜索，↓ 回到草稿） | :h 帮助 | :q 退出
 """
 
 HELP = """\
@@ -2533,7 +2615,9 @@ HELP = """\
   :f <文件>       输入文件内容
   :r              重复上一次提交的内容
   :t              查看当前设置与目标窗口
-  :w <pattern>    设置定向窗口（class:/title:/pid:/re:），:w - 清除
+  :win <pattern>  设置定向窗口（class:/title:/pid:/re:），:win - 清除
+  :p              预览上一次提交的内容（转义显示，不发送任何按键）
+  :w <文件>       把上一次提交的内容保存到文件（0600，拒绝符号链接）
   ↑ / ↓           上一条/下一条历史（先输入前缀可过滤；↓ 回到草稿）
   :h              显示本帮助
   :q              退出
@@ -2632,13 +2716,17 @@ def repl(typer: Typer, cfg: Settings,
                             f"自动回车={'开' if cfg.auto_enter else '关'}\n"
                             f"  定向窗口={cfg.window or '（当前焦点）'}\n"
                             f"  当前目标={target_label(typer)}\n")
-                    elif name == "w":
+                    elif name == "win":
                         if arg in ("-", ""):
                             cfg.window = None
                             sys.stdout.write("  已清除定向窗口\n")
                         else:
                             cfg.window = arg
                             sys.stdout.write(f"  定向窗口={arg}\n")
+                    elif name == "p":
+                        _cmd_preview(typer, cfg, last)
+                    elif name == "w":
+                        sys.stdout.write(_cmd_save(arg, last) + "\n")
                     elif name == "s":
                         cfg.sleep = _num(arg, 0.0, MAX_COUNTDOWN, "倒计时")
                     elif name == "d":
