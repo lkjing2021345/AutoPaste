@@ -34,6 +34,7 @@ class BuildParserTests(unittest.TestCase):
 
 class MainExitCodeTests(unittest.TestCase):
     def _main(self, argv, env, mock_typer=True):
+        self.typer_cls = None
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
@@ -49,6 +50,7 @@ class MainExitCodeTests(unittest.TestCase):
                         "needs_remap": True, "combos": True,
                         "per_char_delay": True, "daemon": False}
                     typer_cls.return_value.focus_info.return_value = None
+                    self.typer_cls = typer_cls
                     code = autopaste.main(argv)
             else:
                 code = autopaste.main(argv)
@@ -81,6 +83,18 @@ class MainExitCodeTests(unittest.TestCase):
         code, out, _ = self._main(["--dry-run", "hi"], {"DISPLAY": ":0"})
         self.assertEqual(code, 0)
         self.assertIn("dry-run", out)
+
+    def test_dry_run_sends_no_injection(self):
+        # 假绿防线：dry-run 必须在 return 之前一次都不调用注入方法
+        code, out, _ = self._main(["--dry-run", "hi"], {"DISPLAY": ":0"})
+        self.assertEqual(code, 0)
+        typer = self.typer_cls.return_value
+        typer.type_text.assert_not_called()
+        typer.type_char.assert_not_called()
+        typer.press.assert_not_called()
+        # 可映射性检查仍然要跑（这是 dry-run 的价值所在）
+        typer.resolvable.assert_called_once_with("hi")
+        self.assertIn("未发送任何按键", out)
 
     def test_root_rejected(self):
         with mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \

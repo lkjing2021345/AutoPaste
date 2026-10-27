@@ -79,15 +79,45 @@ class LineEditorTests(unittest.TestCase):
         self.assertEqual((kind, payload), ("text", "pasted"))
         self.assertIn("已粘贴", out.getvalue())
 
-    def test_oversized_paste_truncated(self):
+    def test_paste_at_exact_limit_is_not_truncated(self):
+        limit = 16
+        payload = b"0123456789abcdef"          # 恰好 limit 字节
+        data = b"\x1b[200~" + payload + b"\x1b[201~\n"
+        with mock.patch.object(autopaste, "MAX_PAYLOAD", limit):
+            kind, text = feed(data)
+        self.assertEqual(kind, "text")
+        self.assertEqual(text, payload.decode())
+
+    def test_oversized_paste_keeps_only_limit_bytes(self):
+        # 契约见 LineEditor._read_paste 文档：截断到恰好 MAX_PAYLOAD 字节，
+        # 而不是老实现的 limit+1。
         limit = 16
         payload = b"0123456789abcdefghij"
         data = b"\x1b[200~" + payload + b"\x1b[201~\n"
         with mock.patch.object(autopaste, "MAX_PAYLOAD", limit):
             kind, text = feed(data)
         self.assertEqual(kind, "text")
-        # _read_paste 在超过上限后停止读取，最多保留 limit+1 个字节
-        self.assertEqual(text, payload[:limit + 1].decode())
+        self.assertEqual(text, payload[:limit].decode())
+
+    def test_oversized_paste_drains_terminator_from_stream(self):
+        # 截断后终止序列必须被消费掉，后续字节原样保留在流里（不被当按键回灌）
+        limit = 16
+        payload = b"0123456789abcdefghij"
+        fd = editor_input(b"\x1b[200~" + payload + b"\x1b[201~" + b"tail\n")
+        try:
+            editor = autopaste.LineEditor(fd)
+            with mock.patch.object(autopaste, "MAX_PAYLOAD", limit):
+                with redirect_std() as (_, err):
+                    # 跳过读() 里的 ESC 处理，直接进入粘贴体
+                    self.assertEqual(editor._read_byte(), 0x1B)
+                    self.assertEqual(editor._read_esc(), "[200~")
+                    text = editor._read_paste()
+                rest = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        self.assertEqual(text, payload[:limit].decode())
+        self.assertEqual(rest, b"tail\n")
+        self.assertIn("已截断并丢弃", err.getvalue())
 
     def test_utf8_input(self):
         self.assertEqual(feed("中文\n".encode("utf-8")), ("text", "中文"))

@@ -968,8 +968,18 @@ class LineEditor:
         return seq
 
     def _read_paste(self) -> str:
+        """读取括号粘贴。契约（超限粘贴的两种可能行为，这里选"截断 + 排空"）：
+
+        * 终止序列 ``\\x1b[201~`` 一定被消费掉，绝不留给后续按键循环当普通
+          输入重新读入（否则命令行会凭空多出 ``[201~`` 之类的字符）；
+        * 载荷最多保留 ``MAX_PAYLOAD`` 字节（恰好等于上限不算超限）；
+        * 超过上限时截断到上限，并**继续读到终止序列为止**丢弃剩余部分
+          （最多再读 ``MAX_PAYLOAD`` 字节，避免无终止序列的管道卡死 REPL），
+          同时在 stderr 明确提示"已截断并丢弃"，不静默吞输入。
+        """
         data = bytearray()
-        while len(data) <= MAX_PAYLOAD:
+        overflow = False
+        while True:
             c = self._read_byte()
             if c is None:
                 break
@@ -977,8 +987,33 @@ class LineEditor:
             if data.endswith(b"\x1b[201~"):
                 del data[-6:]
                 break
+            # 保留窗口里出现完整终止序列的最晚起点是 len-6；再多读 5 字节
+            # 仍没等到终止序列，就说明剩余内容只能丢弃。
+            if len(data) > MAX_PAYLOAD + 4:
+                overflow = True
+                break
+        if overflow:
+            sys.stderr.write(
+                f"⚠ 粘贴内容超过上限 {MAX_PAYLOAD} 字节，"
+                f"已截断并丢弃剩余部分。\n")
+            sys.stderr.flush()
+            self._discard_paste_tail(data[-5:])
+            del data[MAX_PAYLOAD:]
         return (data.decode("utf-8", "replace")
                 .replace("\r\n", "\n").replace("\r", "\n"))
+
+    def _discard_paste_tail(self, window: bytes) -> None:
+        """丢弃超限粘贴的剩余字节，直到终止序列或 EOF（有上限）。"""
+        buf = bytearray(window)
+        for _ in range(MAX_PAYLOAD):
+            c = self._read_byte()
+            if c is None:
+                return
+            buf.append(c)
+            if bytes(buf).endswith(b"\x1b[201~"):
+                return
+            if len(buf) > 6:
+                del buf[0]
 
     @staticmethod
     def _width(s: str) -> int:

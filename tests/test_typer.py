@@ -5,13 +5,15 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import KEYSYM_SHIFT, FakeX11, FakeXtst
+from support import KEYSYM_SHIFT, EventLog, FakeX11, FakeXtst
 
 
 class TyperTestBase(unittest.TestCase):
     def setUp(self):
-        self.x11 = FakeX11(lo=8, hi=64, per=2)
-        self.xtst = FakeXtst()
+        # 两个假后端共享一条事件流，才能断言 remap/tap/restore 的相对顺序
+        self.log = EventLog()
+        self.x11 = FakeX11(lo=8, hi=64, per=2, log=self.log)
+        self.xtst = FakeXtst(log=self.log)
         # 常用键：'a' 'A' 't'，Shift_L，Control_L，Alt_L，Return，Tab
         self.x11.add_key(ord("a"), 38, level0=ord("a"), level1=ord("A"))
         self.x11.add_key(ord("A"), 38, level0=ord("a"), level1=ord("A"))
@@ -74,6 +76,21 @@ class TypeCharTests(TyperTestBase):
         self.assertEqual(restore[1], [0] * self.x11.per)
         self.assertEqual(self.xtst.events, [(self.typer.spare_kc, True),
                                             (self.typer.spare_kc, False)])
+
+    def test_unicode_remap_then_tap_then_restore(self):
+        self.typer.type_char("中")
+        # 顺序错误（如把 restore 提到 tap 之前）会让这条断言失败
+        self.assertEqual(self.log.kinds(),
+                         ["remap", "tap", "tap", "restore"])
+        self.assertEqual(self.log.select("tap"),
+                         [(self.typer.spare_kc, True),
+                          (self.typer.spare_kc, False)])
+
+    def test_unicode_restore_after_failed_tap(self):
+        self.xtst.raise_on = {(self.typer.spare_kc, True)}
+        with self.assertRaises(RuntimeError):
+            self.typer.type_char("中")
+        self.assertEqual(self.log.kinds(), ["remap", "restore"])
 
     def test_unicode_restores_even_when_tap_fails(self):
         self.xtst.raise_on = {(self.typer.spare_kc, True)}

@@ -22,19 +22,48 @@ def _set_out(ptr, value):
     ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int))[0] = value
 
 
+class EventLog:
+    """FakeX11 / FakeXtst 共享的事件流：按真实发生顺序记录。
+
+    两个假后端如果各记各的历史，就无法验证"先 remap、再 tap、后 restore"
+    这类跨后端的时序；共享一条日志后 ``kinds()`` 直接给出发生顺序。
+
+    条目格式：``("remap"|"restore", keycode, [keysym...])`` 或
+    ``("tap", keycode, is_press)``。
+    """
+
+    def __init__(self):
+        self.entries = []
+
+    def record(self, kind, *data):
+        self.entries.append((kind,) + data)
+
+    def kinds(self):
+        return [e[0] for e in self.entries]
+
+    def select(self, kind):
+        return [e[1:] for e in self.entries if e[0] == kind]
+
+
 class FakeX11:
-    def __init__(self, lo=8, hi=64, per=2):
+    def __init__(self, lo=8, hi=64, per=2, log=None):
         self.lo = lo
         self.hi = hi
         self.per = per
+        self.log = EventLog() if log is None else log
         self.dpy = 0x1234
         self.keysym_to_keycode = {}
         self.keycode_to_keysym = {}
         self.name_to_keysym = {}
-        self.mapping_history = []      # [(keycode, [keysym...]), ...]
         self.flush_count = 0
         self.close_count = 0
         self.freed = 0
+
+    @property
+    def mapping_history(self):
+        """[(keycode, [keysym...]), ...]：remap 与 restore 按时间顺序。"""
+        return [(e[1], e[2]) for e in self.log.entries
+                if e[0] in ("remap", "restore")]
 
     # ---- setup helpers
     def add_key(self, keysym, keycode, level0=None, level1=None):
@@ -79,21 +108,29 @@ class FakeX11:
         return (ctypes.c_ulong * max(self.per, 1))()
 
     def XChangeKeyboardMapping(self, dpy, keycode, per, keysyms, num):
-        self.mapping_history.append((keycode, list(keysyms)[:per]))
+        syms = list(keysyms)[:per]
+        # 全 0 的映射就是 X11Backend._restore_keymap()，其余是临时 remap
+        kind = "restore" if not any(syms) else "remap"
+        self.log.record(kind, keycode, syms)
 
     def XkbKeycodeToKeysym(self, dpy, keycode, group, level):
         return self.keycode_to_keysym.get((keycode, group, level), 0)
 
 
 class FakeXtst:
-    def __init__(self):
-        self.events = []            # [(keycode, is_press), ...]
+    def __init__(self, log=None):
+        self.log = EventLog() if log is None else log
         self.raise_on = set()       # {(keycode, is_press)}
+
+    @property
+    def events(self):
+        """[(keycode, is_press), ...]：只取 tap，按时间顺序。"""
+        return self.log.select("tap")
 
     def XTestFakeKeyEvent(self, dpy, keycode, is_press, delay):
         if (keycode, bool(is_press)) in self.raise_on:
             raise RuntimeError("fake XTest 故障")
-        self.events.append((keycode, bool(is_press)))
+        self.log.record("tap", keycode, bool(is_press))
         return 1
 
 
