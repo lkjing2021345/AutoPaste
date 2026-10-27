@@ -17,6 +17,8 @@
 | R_01_1 | 01.1 | ok | [R_01_1.md](R_01_1.md) |
 | R_02 | 02 | pending | [R_02.md](R_02.md) |
 | R_02_1 | 02.1 | issues | [R_02_1.md](R_02_1.md) |
+| R_03 | "03" | issues | [R_03.md](R_03.md) |
+| R_04 | "04" | issues | [R_04.md](R_04.md) |
 <!-- /w1mer:rows -->
 
 ## Reviewer checklist
