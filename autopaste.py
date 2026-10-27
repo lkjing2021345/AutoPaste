@@ -1564,9 +1564,22 @@ def _install_signals() -> None:
             pass
 
 
-if __name__ == "__main__":
+def console_main(argv: list[str] | None = None) -> int:
+    """进程入口：先装信号处理，再跑 main()。
+
+    ``python -m autopaste``、直接执行脚本、pip/pipx 生成的 console script
+    必须走同一个入口。SIGTERM/SIGHUP 默认会立刻终止进程，atexit 不执行，
+    ``Typer.close()`` 就不会还原临时键位映射/释放修饰键——所以信号必须在
+    进入 main() 之前转成 KeyboardInterrupt（SECURITY.md #9）。
+    """
     _install_signals()
     try:
-        sys.exit(main())
+        return main(argv)
     except KeyboardInterrupt:
-        sys.exit(130)
+        # main() 内部已把中断转成 130；这里兜住 argparse 等更早的位置。
+        sys.stderr.write("\n已中断。\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(console_main())

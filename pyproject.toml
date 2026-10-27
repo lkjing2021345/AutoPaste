@@ -36,7 +36,7 @@ Homepage = "https://github.com/lkjing2021345/AutoPaste"
 Source = "https://github.com/lkjing2021345/AutoPaste"
 
 [project.scripts]
-autopaste = "autopaste:main"
+autopaste = "autopaste:console_main"
 
 [tool.setuptools]
 py-modules = ["autopaste"]
