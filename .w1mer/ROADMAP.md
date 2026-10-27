@@ -72,5 +72,5 @@
 
 (Items awaiting re-prioritization)
 <!-- w1mer:task:backlog -->
-| 04 | REPL 与诊断增强（历史/预览/保存、--verbose、配置文件） | REPL 增加上下键历史、:p 预览、:w 保存到文件；新增 --verbose/--quiet 与统一日志出口；支持 ~/.config/autopaste/config.toml 设置默认 delay/sleep/backend；退出码与错误信息统一。 | done | 0 | 2026-10-27 / 739985f: 历史/:p/:w/Log/配置/退出码统一落地，329 测试全绿 |
+| 04 | REPL 与诊断增强（历史/预览/保存、--verbose、配置文件） | REPL 增加上下键历史、:p 预览、:w 保存到文件；新增 --verbose/--quiet 与统一日志出口；支持 ~/.config/autopaste/config.toml 设置默认 delay/sleep/backend；退出码与错误信息统一。 | done | 0 | 2026-10-27 / a9c570a: 历史/:p/:w/Log/配置/退出码统一落地，330 测试全绿 |
 | 05 | 文档体系与 1.1.0 发布 | docs/ 拆分（usage/backends/security/design），README 精简为入口并链接细节；CHANGELOG 补齐 1.1.0；更新 SECURITY.md 覆盖新后端与 --window；打 tag v1.1.0 并推送。 | todo | 0 |
