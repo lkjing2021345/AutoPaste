@@ -33,7 +33,7 @@ pipx install .               # 推荐：装进独立环境，直接得到 autopa
 
 或者不安装，直接 `python3 autopaste.py ...`。
 
-要求：Linux + Python ≥ 3.8。X11 会话开箱即用；Wayland 会话需要 `wtype`（推荐，wlroots/KWin）或 `ydotool`（GNOME 等，需要 `ydotoold` 与 `/dev/uinput` 权限）：
+要求：Linux + Python ≥ 3.8。X11 会话开箱即用；Wayland 会话需要 `wtype`（推荐，wlroots/KWin）或 `ydotool`（GNOME 等，需要 `ydotoold` 与 `/dev/uinput` 权限）。`auto` 在 GNOME 下优先选 `ydotool`（mutter 不支持 wtype 依赖的 virtual-keyboard 协议），其他桌面优先选 `wtype`：
 
 ```bash
 sudo pacman -S wtype ydotool          # Arch
@@ -71,7 +71,7 @@ autopaste --list-backends            # 查看各后端可用性、版本与探�
 | `--allow-root` | 允许 root 运行，默认拒绝 |
 | `-V, --version` | 版本号 |
 
-支持的特殊键名：`enter` `tab` `esc` `backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `up` `down` `left` `right` `space` `f1`~`f12`，修饰键 `ctrl` `alt` `shift` `super`/`win`。文本中的 `\n` 按回车，`\t` 按 Tab。
+支持的特殊键名：`enter` `tab` `esc` `backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `up` `down` `left` `right` `space` `f1`~`f12`，修饰键 `ctrl` `alt` `shift` `super`/`win`/`meta`（wtype 后端会把 `super`/`win`/`meta` 映射成它认识的 `logo`）。文本中的 `\n` 按回车，`\t` 按 Tab（REPL 粘贴的真实换行/Tab；`ydotool` 后端下反斜杠只是字面字符，不做转义解码）。
 
 ### 交互 REPL（推荐）
 
@@ -117,7 +117,7 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 
 ## 已知限制
 
-- **Wayland 需外部工具**。X11 走 XTEST；Wayland 需 `wtype`（合成器需支持 virtual-keyboard 协议，GNOME/mutter 不支持）或 `ydotool`（内核层，但只支持 ASCII，且需要 `ydotoold` + `/dev/uinput` 权限）。
+- **Wayland 需外部工具**。X11 走 XTEST；Wayland 需 `wtype`（合成器需支持 virtual-keyboard 协议，GNOME/mutter 不支持）或 `ydotool`（内核层，但只支持 ASCII 字面量，且需要 `ydotoold` + `/dev/uinput` 权限）。ydotool 调用固定带 `-e 0`，文本中的反斜杠不会被解码成控制字符。GNOME 下 `auto` 会先选 ydotool；若坚持用 wtype 并遇到"协议不支持"，程序会明确报错并提示改用 `--backend ydotool`（不会静默重试）。
 - **Wayland 下看不到焦点窗口**，倒计时只显示"Wayland 会话"；因此所有多行输入都会要求确认。
 - **输入法（fcitx5/ibus）可能拦截个别按键**。之前排查到本机 `XMODIFIERS=@im=fcitx` 时，某些 XIM 程序会吞掉个别单键；遇到时 `export XMODIFIERS=` 再跑。
 - **依赖当前键盘布局**。程序按 keysym 找 keycode，切换布局后行为随之变化；找不到的字符会走临时重映射。

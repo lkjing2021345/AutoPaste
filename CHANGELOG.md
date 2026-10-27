@@ -8,6 +8,11 @@
 - `--backend auto|x11|wtype|ydotool` 与 `--list-backends`（可用性、版本、探测依据）。
 - Wayland 会话的安装/权限诊断文案（ydotoold、`/dev/uinput`、发行版命令）。
 
+### Fixed
+- `ydotool type` 固定传 `-e 0`：反斜杠文本按字面量发送，不再被解码成 `\n`/`\t`/`\xNN`，从而绕过控制字符与多行确认两道闸门。
+- `wtype` 修饰键名映射：`super`/`win`/`meta` → `logo`，未知修饰键在发送前直接拒绝。
+- GNOME 下 `auto` 优先选 `ydotool`；wtype 报协议不支持时明确提示 `--backend ydotool`，不静默重试。
+
 ### Changed
 - libX11/libXtst 改为惰性加载：无 X 库的机器/CI 也能 `--help`、`--version`。
 - 移除"没有 DISPLAY 就退出"的硬检查，改为后端解析失败才退出 2。

@@ -53,8 +53,8 @@ AutoPaste 是一个**键盘注入**工具：它通过可插拔后端向"当前�
 | 8 | **只读普通文件**：`--file` / `:f` 拒绝 FIFO、设备、目录，避免阻塞或读到无限流 | `check_regular_file()` |
 | 9 | **异常安全**：`try/finally` 保证修饰键一定释放、临时键盘映射一定还原；`SIGINT/SIGTERM/SIGHUP` 与 `atexit` 双重兜底；`close()` 幂等 | `Typer._tap()` / `press()` / `close()` |
 | 10 | **不做无边界读取**：REPL 的括号粘贴缓冲也受 1 MiB 限制 | `LineEditor._read_paste()` |
-| 11 | **后端选择可预测**：真 X11 会话永远走 x11；Wayland 按 wtype → ydotool 顺序探测，失败给出具体安装命令；显式 `--backend` 不做静默跨会话回退 | `detect_session()` / `choose_backend()` |
-| 12 | **ydotool 非 ASCII 拦截**：ydotool 不能可靠输入 Unicode，遇到非 ASCII 直接拒绝并给替代方案，绝不静默丢字（避免半截命令被终端执行） | `YdotoolBackend.type_text()` |
+| 11 | **后端选择可预测**：真 X11 会话永远走 x11；Wayland 默认按 wtype → ydotool 探测，GNOME 则反序（mutter 不支持 virtual-keyboard 协议），失败给出具体安装命令；显式 `--backend` 不做静默跨会话回退 | `detect_session()` / `choose_backend()` |
+| 12 | **ydotool 仅接受 ASCII 字面量**：不能可靠输入 Unicode，遇到非 ASCII 直接拒绝并给替代方案，绝不静默丢字；调用 `type` 时固定传 `-e 0` 关闭上游的反斜杠转义，`\n`/`\t`/`\xNN` 只作为字面字符发送，不会在工具侧"复活"成控制字符 | `YdotoolBackend.type_text()` |
 | 13 | **无 X 库也能安全降级**：libX11/libXtst 惰性加载，纯 Wayland/CI 上 `--help`/`--version`/`--dry-run` 不会因缺库崩溃 | `_load_x11()` |
 
 ---
@@ -68,7 +68,7 @@ AutoPaste 是一个**键盘注入**工具：它通过可插拔后端向"当前�
 5. **输入法/第三方软件**：fcitx5 等 XIM 程序可能看到你在输入什么，这是输入法的固有行为，与本工具无关。
 6. **无障碍/辅助技术**：XTEST 注入与真实键盘一致，某些安全软件可能不区分二者。
 7. **Wayland 下读不到焦点窗口**：`wtype`/`ydotool` 后端无法像 X11 那样查询目标窗口，倒计时只显示"Wayland 会话（看不到焦点窗口）"。这降低了"敲错窗口"的可视化保护，请务必自己确认焦点；多行输入会强制确认。
-8. **ydotool 的内核级权限**：`ydotool` 需要用户对 `/dev/uinput` 可写（通常在 `input` 组）。这个权限本身允许向系统注入任意输入事件，请只授予你自己的用户，不要用 `sudo` 运行本程序。`wtype` 依赖合成器实现 `zwp_virtual_keyboard_manager_v1`（wlroots 系与 KWin 支持，GNOME/mutter 不支持）。
+8. **ydotool 的内核级权限**：`ydotool` 需要用户对 `/dev/uinput` 可写（通常在 `input` 组）。这个权限本身允许向系统注入任意输入事件，请只授予你自己的用户，不要用 `sudo` 运行本程序。`wtype` 依赖合成器实现 `zwp_virtual_keyboard_manager_v1`（wlroots 系与 KWin 支持，GNOME/mutter 不支持；因此 GNOME 下 `auto` 优先选 ydotool，wtype 运行期报"协议不支持"时只会明确报错、不会静默重试）。`wtype` 只接受自己的修饰键名，本程序在发送前把 `super`/`win`/`meta` 映射为 `logo`，其余未知修饰键直接拒绝。
 
 ---
 

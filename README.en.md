@@ -28,7 +28,7 @@ git clone git@github.com:lkjing2021345/AutoPaste.git
 cd AutoPaste && ./install.sh     # symlink to ~/.local/bin/autopaste
 ```
 
-Requirements: Linux, Python ≥ 3.8. X11 works out of the box; Wayland needs `wtype` (recommended; wlroots/KWin) or `ydotool` (GNOME; requires `ydotoold` and `/dev/uinput` access).
+Requirements: Linux, Python ≥ 3.8. X11 works out of the box; Wayland needs `wtype` (recommended; wlroots/KWin) or `ydotool` (GNOME; requires `ydotoold` and `/dev/uinput` access). On GNOME, `auto` prefers `ydotool` (mutter lacks the virtual-keyboard protocol wtype needs); other desktops prefer `wtype`.
 
 ## CLI
 
@@ -46,7 +46,7 @@ Requirements: Linux, Python ≥ 3.8. X11 works out of the box; Wayland needs `wt
 | `--allow-control` | allow control characters (ESC etc.), rejected by default |
 | `--allow-root` | allow running as root (not recommended) |
 
-Special key names: `enter tab esc backspace delete insert home end pageup pagedown up down left right space f1`–`f12`; modifiers `ctrl alt shift super`.
+Special key names: `enter tab esc backspace delete insert home end pageup pagedown up down left right space f1`–`f12`; modifiers `ctrl alt shift super`/`win`/`meta` (the wtype backend maps `super`/`win`/`meta` to its `logo` modifier).
 
 ## REPL
 
@@ -54,7 +54,7 @@ Run without arguments. `:s <sec>` countdown, `:d <sec>` per-char delay, `:nl` to
 
 ## Limitations
 
-- Wayland needs an external tool: `wtype` (compositor must support virtual-keyboard; GNOME/mutter does not) or `ydotool` (ASCII only, `ydotoold` + `/dev/uinput`).
+- Wayland needs an external tool: `wtype` (compositor must support virtual-keyboard; GNOME/mutter does not) or `ydotool` (ASCII literal text only, `ydotoold` + `/dev/uinput`). ydotool is always called with `-e 0`, so backslashes are never decoded into control characters. On GNOME, `auto` picks ydotool first; if wtype reports an unsupported protocol the program fails with a `--backend ydotool` hint instead of silently retrying.
 - The focused window cannot be inspected on Wayland, so every multi-line payload requires confirmation there.
 - Input methods (fcitx5/ibus) may swallow individual keys under some XIM apps — `export XMODIFIERS=` helps.
 - Follows the active keyboard layout; unmappable characters use a temporary keycode remap.
