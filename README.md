@@ -19,6 +19,10 @@ autopaste                      # 交互 REPL：粘贴多行文本，零转义
 - **REPL 模式**：支持终端括号粘贴，粘进来的多行文本原样输入，不用管引号、`!`、`$`、反引号。
 - **组合键**：`-k ctrl+alt+t`、`-k ctrl+shift+v`、方向键 / F1~F12 / Home / End 等。
 - **目标可见**：倒计时期间会显示"即将输入到哪个窗口"，避免敲错地方。
+- **定向窗口**：`--window class:firefox` 按 WM_CLASS/标题/PID 选中窗口并校验焦点；
+  `--list-windows` 列出可定向的窗口。
+- **大段文本直贴**：`--paste-mode` 写入剪贴板后按一次粘贴键（终端自动用
+  `Ctrl+Shift+V`），并默认备份/恢复原剪贴板。
 - **安全默认值**：拒绝 root 运行、拒绝控制字符、拒绝 FIFO/设备文件、终端里的多行文本二次确认。详见 [SECURITY.md](SECURITY.md)。
 
 ## 安装
@@ -56,7 +60,26 @@ autopaste -k ctrl+v -k enter         # 多个动作连发
 autopaste --dry-run "x < y"          # 只预览目标和内容，不敲键
 autopaste --backend wtype "hello"    # 显式指定后端（auto|x11|wtype|ydotool）
 autopaste --list-backends            # 查看各后端可用性、版本与探测依据
+autopaste --list-windows             # 列出可定向的窗口（TSV，可 grep）
+autopaste --window class:firefox "hi"  # 定向到 Firefox（X11 里还会校验焦点）
+autopaste --paste-mode -f big.txt    # 大段文本：写剪贴板 + 一次粘贴键
+autopaste --paste-mode --dry-run -f big.txt  # 只预览，不碰剪贴板
 ```
+
+`--window` 的 pattern 默认是**大小写不敏感子串**（匹配 WM_CLASS/instance/标题），
+也可用前缀精确限定：
+
+| pattern | 含义 |
+|---|---|
+| `class:kitty` | 只匹配 WM_CLASS / instance |
+| `title:文档` | 只匹配窗口标题 |
+| `pid:1234` | 按 `_NET_WM_PID` 精确匹配 |
+| `id:0x03e00005` | 按 X11 window id 精确匹配 |
+| `re:^(\[)?nvim` | 正则（唯一显式 opt-in 的正则入口，大小写不敏感） |
+
+多个窗口匹配时：若当前激活窗口在候选里就用它，否则列出候选（`id`/`class`/`pid`/`title`）
+并退出 2；在交互终端里会让你选择。`--list-windows` 输出 6 列 TSV
+（`ID CLASS PID DESKTOP ACTIVE TITLE`），加 `--json` 输出 JSON。
 
 | 参数 | 说明 |
 |---|---|
@@ -66,10 +89,28 @@ autopaste --list-backends            # 查看各后端可用性、版本与探�
 | `-n, --no-newline` | 去掉文件/stdin 结尾的换行 |
 | `-k, --key 键名` | 按键或组合键，可重复 |
 | `--dry-run` | 打印目标窗口、字符数、内容预览，不发送按键 |
+| `--safe` | X11 逐字符保守发送（每字符 flush+sleep），不用批量事件 |
 | `-y, --yes` | 跳过"终端 + 多行"确认 |
 | `--allow-control` | 允许控制字符（ESC 等），默认拒绝 |
 | `--allow-root` | 允许 root 运行，默认拒绝 |
+| `--window PATTERN` | 定向窗口（默认子串；`class:` `title:` `pid:` `id:` `re:`） |
+| `--list-windows` | 列出窗口（TSV）后退出，可与 `--window` 过滤合用 |
+| `--json` | 配合 `--list-windows` 输出 JSON |
+| `--paste-mode` | 写剪贴板 + 发送一次粘贴键（大段文本首选） |
+| `--paste-key COMBO` | 覆盖粘贴快捷键（默认按目标自动选） |
+| `--paste-wait 秒` | 粘贴后等待目标取走内容的秒数（默认按体积 0.5–3s） |
+| `--no-clipboard-backup` | 不备份/不恢复剪贴板（默认备份失败即停止） |
 | `-V, --version` | 版本号 |
+
+### 退出码
+
+| 码 | 含义 |
+|---|---|
+| 0 | 成功（含 `--list-windows`/`--dry-run`） |
+| 1 | 参数错误、控制字符/安全检查拦截 |
+| 2 | 环境不可用（无后端/无窗口能力）或找不到/无法激活目标窗口、剪贴板无法安全备份 |
+| 3 | 用户取消，或倒计时结束时焦点已离开 `--window` 目标 |
+| 130 | 被 `Ctrl-C`/`SIGINT`/`SIGTERM` 中断 |
 
 支持的特殊键名：`enter` `tab` `esc` `backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `up` `down` `left` `right` `space` `f1`~`f12`，修饰键 `ctrl` `alt` `shift` `super`/`win`/`meta`（wtype 后端会把 `super`/`win`/`meta` 映射成它认识的 `logo`）。文本中的 `\n` 按回车，`\t` 按 Tab（REPL 粘贴的真实换行/Tab；`ydotool` 后端下反斜杠只是字面字符，不做转义解码）。
 
@@ -94,6 +135,7 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 | `:f note.txt` | 输入文件内容 |
 | `:r` | 重复上一次提交的内容 |
 | `:t` | 显示当前设置与目标窗口 |
+| `:w <pattern>` | 设置/查看定向窗口，`:w -` 清除 |
 | `:h` / `:q` | 帮助 / 退出 |
 
 行编辑：方向键、`Home`/`End`、`Backspace`/`Delete`、`Ctrl-U`、`Ctrl-W`、`Ctrl-C` 取消、`Ctrl-D` 退出。
@@ -110,8 +152,13 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 6. 输入上限 1 MiB、延时有上限，避免误喂 `yes`/超大管道；
 7. 只接受普通文件，不读 FIFO/设备文件；
 8. 异常/`Ctrl-C`/`SIGTERM` 时都会还原被临时改写的键盘映射，不在系统里留下坏键位；
-9. 不联网、不读剪贴板、不写文件；Wayland 后端只以固定 argv 调用 `wtype`/`ydotool`
-   （不经 shell），X11 后端不启动任何外部进程。
+9. 不联网、不写文件；Wayland 后端只以固定 argv 调用 `wtype`/`ydotool`
+   （不经 shell），X11 后端不启动外部进程。唯一的例外是显式 `--paste-mode`：
+   它会调用 `xclip`/`xsel`/`wl-copy` 读写**系统剪贴板**（先备份、贴完恢复；
+   剪贴板管理器仍可能留存历史），以及 `--window` 会在确认后主动激活目标窗口。
+10. 大文本请用 `--paste-mode`。X11 逐字符注入已改为批量事件（吞吐提升、flush
+    次数大幅下降），但 `--delay` 是真实等待：1 MiB 文本按默认 8ms 仍要约 2.3 小时。
+    批量模式下 `--delay` 最小 1ms；若目标应用丢字或你要求旧时序，用 `--safe`。
 
 完整威胁模型与"本工具防不了什么"见 **[SECURITY.md](SECURITY.md)**。
 
@@ -122,6 +169,14 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 - **输入法（fcitx5/ibus）可能拦截个别按键**。之前排查到本机 `XMODIFIERS=@im=fcitx` 时，某些 XIM 程序会吞掉个别单键；遇到时 `export XMODIFIERS=` 再跑。
 - **依赖当前键盘布局**。程序按 keysym 找 keycode，切换布局后行为随之变化；找不到的字符会走临时重映射。
 - 少数程序用扫描码/原始设备事件（如部分游戏、反作弊），XTEST 注入不生效。
+- **`--window` 可能被 WM 拒绝**：i3/sway 的 `focus_on_window_activation`、KWin 的
+  焦点窃取防护、GNOME 的激活策略都可能阻止焦点切换。程序会轮询确认并在失败时
+  退出 2，不会退回去敲当前焦点窗口。
+- **`--paste-mode` 会短暂改写系统剪贴板**：默认备份/恢复，但恢复不等于擦除，
+  剪贴板管理器（klipper/clipman 等）可能留下历史；某些应用不响应 `Ctrl+V`，
+  本工具无法检测"是否贴上"，建议先 `--dry-run` 确认目标。
+- **批量注入中断后**最多还会送出约 250ms 已排队的按键（无法撤回）；对时序敏感
+  的场合用 `--safe` 或调大 `--delay`。
 
 ## 故障排查
 

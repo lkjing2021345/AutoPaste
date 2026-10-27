@@ -7,6 +7,18 @@
 - Wayland 支持：`wtype`（虚拟键盘协议）与 `ydotool`（`/dev/uinput`，仅 ASCII）后端。
 - `--backend auto|x11|wtype|ydotool` 与 `--list-backends`（可用性、版本、探测依据）。
 - Wayland 会话的安装/权限诊断文案（ydotoold、`/dev/uinput`、发行版命令）。
+- `--window <pattern>` 目标窗口定向：EWMH `_NET_CLIENT_LIST` 优先、`XQueryTree`
+  兜底枚举；默认大小写不敏感子串，支持 `class:` `title:` `pid:` `id:` `re:`
+  前缀；发送 `_NET_ACTIVE_WINDOW` 后轮询 `XGetInputFocus` 确认焦点，
+  倒计时结束再复核一次，焦点被抢走则取消（退出码 3）。
+- `--list-windows`（TSV，6 列：ID/CLASS/PID/DESKTOP/ACTIVE/TITLE）与
+  `--list-windows --json`，只读、不激活、不注入。
+- `--paste-mode`：把 payload 写入剪贴板并发送一次粘贴键（终端自动用
+  `ctrl+shift+v`，xterm 系用 `shift+insert`，其他 `ctrl+v`；`--paste-key` 可覆盖）。
+  默认先备份原剪贴板（仅文本、≤4 MiB）并在粘贴后恢复；备份失败即停止。
+- `--paste-wait`（按体积默认 0.5–3s）与 `--no-clipboard-backup`
+  （别名 `--no-restore-clipboard`）。
+- `tools/bench.py`：不依赖真实焦点窗口的事件发送基准。
 
 ### Fixed
 - `ydotool type` 固定传 `-e 0`：反斜杠文本按字面量发送，不再被解码成 `\n`/`\t`/`\xNN`，从而绕过控制字符与多行确认两道闸门。
@@ -18,6 +30,18 @@
 - 移除"没有 DISPLAY 就退出"的硬检查，改为后端解析失败才退出 2。
 - Wayland 读不到焦点窗口：所有多行输入一律要求确认（`-y` 可跳过），比原先只拦终端更严。
 - 组合键解析提取为共享的 `parse_combo()`；Wayland 后端按 UTF-8 边界分片（≤32 KiB）避免 `E2BIG`。
+- **X11 逐字符注入改为批量事件**：不再每字符 `XFlush` + 客户端 `sleep`，
+  而是分块 flush（服务端排队 ≤250ms）并把 `--delay` 放到 XTest 的 press 事件上。
+  事件序列与旧版逐字符模式完全一致；`--delay` 语义仍是"相邻字符间隔"，
+  精度变为 1ms（批量模式下 `--delay` 有 1ms 下限）。
+  实测（模拟后端）`--delay 0` 约 45.8 万 → 75.6 万字符/秒，flush 次数
+  20000 → 79；`--delay 0.008` 受 8ms 间隔限制，两种模式都约 122 字符/秒。
+  大文本请用 `--paste-mode`（1 MiB 逐字符仍要约 2.3 小时）。
+- 新增 `--safe`：强制回到逐字符（每字符 flush + sleep）的保守路径；
+  若某些 Xorg/驱动上 XTest 的 delay 会造成整机输入卡顿，也可用
+  `USE_XTEST_DELAY=False` 全局关闭批量（见 `tools/bench.py`）。
+- 退出码明确化：0 成功、1 参数/安全检查、2 环境或目标窗口不可用、
+  3 用户取消/焦点复核失败、130 中断。
 
 ## 1.0.0 — 2026-10-27
 

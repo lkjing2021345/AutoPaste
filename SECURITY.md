@@ -16,14 +16,19 @@ AutoPaste 是一个**键盘注入**工具：它通过可插拔后端向"当前�
 | 输入多行文本 | 在终端里等于**逐行执行 shell 命令** |
 | 临时改写一个空闲 keycode 的键盘映射（仅 X11 后端） | 如果程序被强制杀死，可能留下异常键位（不影响数据） |
 | 模拟组合键 | 可触发快捷键（如 `ctrl+alt+t` 打开终端、`ctrl+s` 保存） |
+| `--window` 激活指定窗口 | 可把焦点从你当前的窗口切走；激活后会轮询确认焦点，失败则退出 |
+| `--paste-mode` 读写系统剪贴板 | 会把 payload 写进全局剪贴板，并默认尝试备份/恢复原内容；剪贴板管理器可能留存历史 |
 | 以固定 argv 调用外部工具 `wtype` / `ydotool`（仅 Wayland 后端） | 工具本身的能力边界：`ydotool` 需要 `/dev/uinput` 权限，能向内核注入任意按键 |
+| 以固定 argv 调用 `xclip` / `xsel` / `wl-copy`（仅显式 `--paste-mode`） | 这些工具能读整个剪贴板；本程序只读一次用于备份，随后写入 payload |
 
 ### 它不能做什么
 
-- **不联网**：没有任何 socket / HTTP 调用。
-- **不读剪贴板**：不碰 X selection，内容只来自命令行参数、`--file`、stdin 或 REPL 输入。
-- **不执行 shell**：没有 `os.system` / `eval`。Wayland 后端会以固定 argv 调用外部命令 `wtype` / `ydotool`（Python `subprocess`，`shell=False`），参数数组直传、**从不经过 shell**；输入文本只作为 `wtype`/`ydotool` 的命令行参数传递，不进入任何其他通道。X11 后端完全不 spawn 进程。
-- **不读外部数据**：不读剪贴板、不访问网络；Wayland 后端仅探测 `wtype`/`ydotool` 的可执行文件与本地 socket 是否存在。
+- **不联网**：没有任何 socket / HTTP 调用（`--window`/`--paste-mode` 也不联网）。
+- **默认不读剪贴板**：不加 `--paste-mode` 时完全不碰 X selection / Wayland clipboard；
+  内容只来自命令行参数、`--file`、stdin 或 REPL 输入。加了 `--paste-mode` 才会
+  读一次原剪贴板用于备份，并在结束后恢复。
+- **不执行 shell**：没有 `os.system` / `eval`。Wayland 后端会以固定 argv 调用外部命令 `wtype` / `ydotool`（Python `subprocess`，`shell=False`），参数数组直传、**从不经过 shell**；输入文本只作为 `wtype`/`ydotool` 的命令行参数传递，不进入任何其他通道。X11 后端不 spawn 进程（`--paste-mode` 的剪贴板工具是唯一例外）。
+- **不读外部数据**：不访问网络；除显式 `--paste-mode` 外不读剪贴板；Wayland 后端仅探测 `wtype`/`ydotool` 的可执行文件与本地 socket 是否存在。
 - **不写文件**：除了 REPL 里用 `:f` 读文件，不会创建或修改任何文件。
 - **不提升权限**：默认拒绝 root 运行。
 
@@ -56,6 +61,12 @@ AutoPaste 是一个**键盘注入**工具：它通过可插拔后端向"当前�
 | 11 | **后端选择可预测**：真 X11 会话永远走 x11；Wayland 默认按 wtype → ydotool 探测，GNOME 则反序（mutter 不支持 virtual-keyboard 协议），失败给出具体安装命令；显式 `--backend` 不做静默跨会话回退 | `detect_session()` / `choose_backend()` |
 | 12 | **ydotool 仅接受 ASCII 字面量**：不能可靠输入 Unicode，遇到非 ASCII 直接拒绝并给替代方案，绝不静默丢字；调用 `type` 时固定传 `-e 0` 关闭上游的反斜杠转义，`\n`/`\t`/`\xNN` 只作为字面字符发送，不会在工具侧"复活"成控制字符 | `YdotoolBackend.type_text()` |
 | 13 | **无 X 库也能安全降级**：libX11/libXtst 惰性加载，纯 Wayland/CI 上 `--help`/`--version`/`--dry-run` 不会因缺库崩溃 | `_load_x11()` |
+| 14 | **`--window` 只敲定向窗口**：EWMH/XQueryTree 枚举 → pattern 匹配 → 激活后轮询 `XGetInputFocus`（含 parent 链）确认焦点；倒计时结束再复核一次，焦点离开立即取消（退出 3），绝不退回当前焦点 | `resolve_window()` / `activate_window_x11()` / `main()` |
+| 15 | **歧义不猜**：多个窗口匹配且当前激活窗口不在其中时，非交互环境退出 2 并列出候选；交互环境必须手动选择 | `pick_window()` |
+| 16 | **XID 复用检测**：激活前重读 WM_CLASS，与解析时不一致就拒绝 | `_same_window()` |
+| 17 | **剪贴板 fail-closed**：`--paste-mode` 默认先备份（仅文本、≤4 MiB），备份失败/超限/非文本就退出 2；只有显式 `--no-clipboard-backup` 才覆盖；恢复放在 `finally`，按粘贴键抛异常也会恢复 | `paste_text()` |
+| 18 | **`--dry-run` 零副作用**：不激活窗口、不读写剪贴板、不发送按键 | `main()` |
+| 19 | **批量注入有界**：X11 分块 flush，服务端最多排队 250ms；`--delay` 在批量模式下有 1ms 下限；`--safe`（或 `USE_XTEST_DELAY=False`）可退回逐字符 | `X11Backend.type_text()` |
 
 ---
 
@@ -69,6 +80,9 @@ AutoPaste 是一个**键盘注入**工具：它通过可插拔后端向"当前�
 6. **无障碍/辅助技术**：XTEST 注入与真实键盘一致，某些安全软件可能不区分二者。
 7. **Wayland 下读不到焦点窗口**：`wtype`/`ydotool` 后端无法像 X11 那样查询目标窗口，倒计时只显示"Wayland 会话（看不到焦点窗口）"。这降低了"敲错窗口"的可视化保护，请务必自己确认焦点；多行输入会强制确认。
 8. **ydotool 的内核级权限**：`ydotool` 需要用户对 `/dev/uinput` 可写（通常在 `input` 组）。这个权限本身允许向系统注入任意输入事件，请只授予你自己的用户，不要用 `sudo` 运行本程序。`wtype` 依赖合成器实现 `zwp_virtual_keyboard_manager_v1`（wlroots 系与 KWin 支持，GNOME/mutter 不支持；因此 GNOME 下 `auto` 优先选 ydotool，wtype 运行期报"协议不支持"时只会明确报错、不会静默重试）。`wtype` 只接受自己的修饰键名，本程序在发送前把 `super`/`win`/`meta` 映射为 `logo`，其余未知修饰键直接拒绝。
+9. **`--window` 的焦点抢占**：激活请求可能被窗口管理器拒绝（i3/sway 的 `focus_on_window_activation`、KWin 的焦点窃取防护、GNOME 策略）。程序会确认失败并退出 2；但"激活成功"也不代表窗口内容可信——仍是你在该窗口里能做的任何操作。
+10. **`--paste-mode` 的剪贴板风险**：payload 会进入**全局剪贴板**，同会话的任何程序/剪贴板管理器都能读取并留存历史；恢复原内容不等于擦除。剪贴板里的图片/大对象无法安全备份时默认拒绝覆盖。某些应用不响应 `Ctrl+V`，本工具无法检测是否真的贴上。
+11. **批量注入的残留窗口**：为降低每字符开销，X11 事件会成批排队（≤250ms）。`Ctrl-C`/`SIGTERM` 后最多还会再送出约 250ms 的按键，无法撤回；对时序敏感的场合用 `--safe`。
 
 ---
 

@@ -15,6 +15,10 @@
     autopaste --dry-run "check me"     # 只预览、不真的敲键
     autopaste --backend wtype "hi"     # 显式指定后端（auto|x11|wtype|ydotool）
     autopaste --list-backends          # 查看各后端可用性与探测依据
+    autopaste --list-windows           # 列出可定向的窗口（TSV）
+    autopaste --window class:kitty "hi"# 定向窗口并校验焦点（X11）
+    autopaste --paste-mode -f big.txt  # 大段文本：写剪贴板 + 一次粘贴键
+    autopaste --dry-run --window class:kitty "hi"  # 只预览，不激活/不碰剪贴板
 
 后端: X11 用 XTEST；Wayland 用 wtype（虚拟键盘协议）或 ydotool（/dev/uinput，
 仅 ASCII）。auto 规则: 真 X11 会话 -> x11；Wayland -> wtype -> ydotool。
@@ -277,6 +281,14 @@ WTYPE_MODIFIERS = {
 }
 
 KEYSYM_SHIFT = 0xFFE1  # Shift_L
+
+#: 批量路径：服务端最多排队 250ms 的按键（Ctrl-C 后残留上限）
+QUEUE_BUDGET_MS = 250
+#: delay==0 时每发送多少字符 flush 一次
+FLUSH_EVERY_NODELAY = 256
+#: 某些 Xorg/驱动把 XTest 的 delay 实现成"服务器睡眠"（会卡整机输入）；
+#: 遇到这种情况把它设为 False，退回"客户端 sleep"的保守路径（--safe 同理）。
+USE_XTEST_DELAY = True
 
 
 class Abort(Exception):
@@ -574,8 +586,9 @@ def list_windows_x11(dpy) -> list[WindowInfo]:
     返回顺序为叠放顺序（最上层在最后）。最小化窗口仍保留在 EWMH 列表里。
     """
     root = _root(dpy)
-    clients = _prop32(dpy, root, "_NET_CLIENT_LIST")
-    stacking = _prop32(dpy, root, "_NET_CLIENT_LIST_STACKING") or []
+    clients = _prop32(dpy, root, "_NET_CLIENT_LIST", limit=1024)
+    stacking = _prop32(dpy, root, "_NET_CLIENT_LIST_STACKING",
+                       limit=1024) or []
     if not clients:
         clients = _walk_clients(dpy, root)
     order = {xid: i for i, xid in enumerate(stacking)}
@@ -922,6 +935,8 @@ class Backend:
     """
 
     name = "base"
+    #: 批量发送事件（仅 X11 有实现；--safe 会把它置 False）
+    batch_enabled = True
 
     def type_text(self, text: str) -> None:
         raise NotImplementedError
@@ -1057,8 +1072,101 @@ class X11Backend(Backend):
         self._remapped = False
 
     def type_text(self, text: str) -> None:
+        """批量发送：单次 flush + XTest 服务端 delay（--delay 语义不变）。
+
+        与逐字符模式产生**完全相同**的 press/release 序列；只是不再每个
+        字符都 flush 一次、也不在客户端 sleep。
+        """
+        if not (USE_XTEST_DELAY and self.batch_enabled):
+            return self._type_text_per_char(text)
+        delay_ms = _delay_ms(self.delay) if self.delay > 0 else 0
+        budget = (max(1, QUEUE_BUDGET_MS // delay_ms) if delay_ms
+                  else FLUSH_EVERY_NODELAY)
+        n = 0
+        try:
+            for ch in text:
+                if ch == "\n":
+                    self._press_raw("enter", delay_ms)
+                elif ch == "\t":
+                    self._press_raw("tab", delay_ms)
+                elif ch == "\r":
+                    continue
+                else:
+                    kc, shift = self.keycode_for(_char_keysym(ch))
+                    if kc:
+                        self._tap_raw(kc, shift, delay_ms)
+                    else:
+                        # Unicode 需要 remap 往返 + 还原键位，不能与批量事件交错
+                        x11.XFlush(self.dpy)
+                        n = 0
+                        self.type_char(ch)
+                        continue
+                n += 1
+                if n >= budget:
+                    x11.XFlush(self.dpy)
+                    n = 0
+        finally:
+            x11.XFlush(self.dpy)     # 异常/中断也把已排队事件送出去
+
+    def _type_text_per_char(self, text: str) -> None:
+        """保守路径（--safe / USE_XTEST_DELAY=False）：保持旧行为。"""
         for ch in text:
             self.type_char(ch)
+
+    def _tap_raw(self, kc: int, shift: bool = False, delay_ms: int = 0) -> None:
+        """只排队事件、不 flush；延迟只加在按下事件上。"""
+        d = self.dpy
+        if shift and self.shift_kc:
+            xtst.XTestFakeKeyEvent(d, self.shift_kc, True, 0)
+        try:
+            xtst.XTestFakeKeyEvent(d, kc, True, delay_ms)
+            xtst.XTestFakeKeyEvent(d, kc, False, 0)
+        finally:
+            if shift and self.shift_kc:
+                xtst.XTestFakeKeyEvent(d, self.shift_kc, False, 0)
+
+    def _resolve_key(self, name: str):
+        """解析按键名 -> (keycode, shift, 修饰键 keycode 列表, key)。"""
+        tokens = name.split("+")
+        mods = []
+        for t in tokens[:-1]:
+            t = t.lower().strip()
+            if t not in MODIFIERS:
+                raise Abort(f"未知修饰键: {t}")
+            mods.append(x11.XKeysymToKeycode(
+                self.dpy, x11.XStringToKeysym(MODIFIERS[t].encode())))
+        key = tokens[-1].strip()
+        low = key.lower()
+
+        if low in MODIFIERS:
+            ks_name, ks = MODIFIERS[low], None
+        elif low in SPECIAL:
+            ks_name, ks = SPECIAL[low], None
+        elif len(key) == 1:
+            ks_name, ks = None, _char_keysym(key)
+        else:
+            ks_name, ks = key, None
+
+        if ks is None:
+            ks = x11.XStringToKeysym(ks_name.encode())
+            if not ks:
+                raise Abort(f"未知按键: {key}")
+        kc, shift = self.keycode_for(ks)
+        return kc, shift, mods, key
+
+    def _press_raw(self, name: str, delay_ms: int = 0) -> None:
+        kc, shift, mods, key = self._resolve_key(name)
+        if not kc:
+            raise Abort(f"当前键盘布局中没有该键: {key}")
+        pressed = []
+        try:
+            for m in mods:
+                xtst.XTestFakeKeyEvent(self.dpy, m, True, 0)
+                pressed.append(m)
+            self._tap_raw(kc, shift, delay_ms)
+        finally:
+            for m in reversed(pressed):      # 异常时也不留按住的修饰键
+                xtst.XTestFakeKeyEvent(self.dpy, m, False, 0)
 
     def type_char(self, ch: str) -> None:
         if ch == "\n":
@@ -1086,32 +1194,7 @@ class X11Backend(Backend):
 
     def press(self, name: str) -> None:
         """按键或组合键，例如 "enter" / "ctrl+alt+t" """
-        tokens = name.split("+")
-        mods = []
-        for t in tokens[:-1]:
-            t = t.lower().strip()
-            if t not in MODIFIERS:
-                raise Abort(f"未知修饰键: {t}")
-            mods.append(x11.XKeysymToKeycode(
-                self.dpy, x11.XStringToKeysym(MODIFIERS[t].encode())))
-        key = tokens[-1].strip()
-        low = key.lower()
-
-        if low in MODIFIERS:
-            ks_name, ks = MODIFIERS[low], None
-        elif low in SPECIAL:
-            ks_name, ks = SPECIAL[low], None
-        elif len(key) == 1:
-            ks_name, ks = None, _char_keysym(key)
-        else:
-            ks_name, ks = key, None
-
-        if ks is None:
-            ks = x11.XStringToKeysym(ks_name.encode())
-            if not ks:
-                raise Abort(f"未知按键: {key}")
-
-        kc, shift = self.keycode_for(ks)
+        kc, shift, mods, key = self._resolve_key(name)
         if not kc:
             if len(key) == 1:
                 return self.type_char(key)
@@ -2330,10 +2413,14 @@ def build_parser() -> argparse.ArgumentParser:
   autopaste -k ctrl+shift+v          发送组合键
   autopaste --backend wtype 'hi'     指定后端（Wayland）
   autopaste --list-backends          查看后端可用性
+  autopaste --list-windows           列出可定向窗口
+  autopaste --window class:firefox 'hi'  定向窗口（X11，校验焦点）
+  autopaste --paste-mode -f big.txt  剪贴板直贴大段文本
 
 安全:
   * 默认拒绝 root 运行、拒绝控制字符（ESC 等）、拒绝 FIFO/设备文件；
   * 多行文本打进终端会二次确认（Wayland 下所有多行都确认）；
+  * --window 会主动激活目标窗口；--paste-mode 会改写系统剪贴板（默认备份/恢复）；
   * 详见 SECURITY.md。
 
 zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，或直接用 REPL 粘贴。
@@ -2351,6 +2438,8 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
     ap.add_argument("--repl", action="store_true", help="强制进入交互 REPL")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印将要输入的内容与目标窗口，不发送任何按键")
+    ap.add_argument("--safe", action="store_true",
+                    help="X11 逐字符保守发送（每字符 flush+sleep），不用批量事件")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="跳过确认提示（终端目标 + 多行文本时使用）")
     ap.add_argument("--allow-control", action="store_true",
@@ -2605,6 +2694,8 @@ def main(argv: list[str] | None = None) -> int:
             validate_payload(item, args.allow_control)
 
         typer = Typer(backend=args.backend, delay=delay)
+        if args.safe:
+            typer.backend.batch_enabled = False
         if args.paste_mode and not typer.capabilities().get("combos"):
             raise BackendUnavailable(
                 f"当前后端 {args.backend} 不支持组合键，无法使用 --paste-mode。")
