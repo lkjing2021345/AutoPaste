@@ -305,7 +305,8 @@ class Backend:
         return {"name": self.name, "can_focus_info": False,
                 "can_paste_mode": False, "unicode": False,
                 "needs_remap": False, "combos": False,
-                "per_char_delay": False, "daemon": False}
+                "per_char_delay": False, "daemon": False,
+                "escapes_supported": None}
 
     def resolvable(self, text: str) -> list[str]:
         return []
@@ -486,7 +487,8 @@ class X11Backend(Backend):
         return {"name": self.name, "can_focus_info": True,
                 "can_paste_mode": False, "unicode": True,
                 "needs_remap": True, "combos": True,
-                "per_char_delay": True, "daemon": False}
+                "per_char_delay": True, "daemon": False,
+                "escapes_supported": True}
 
     # ------------------------------------------------------------- 清理
     def close(self) -> None:
@@ -614,7 +616,8 @@ class WtypeBackend(Backend):
         return {"name": self.name, "can_focus_info": False,
                 "can_paste_mode": False, "unicode": True,
                 "needs_remap": False, "combos": True,
-                "per_char_delay": True, "daemon": False}
+                "per_char_delay": True, "daemon": False,
+                "escapes_supported": True}
 
 
 #: evdev keycode 表（ydotool key 用；只收常用键，未知键一律报错不猜）
@@ -669,12 +672,38 @@ def _ydotool_socket_ok(env=None) -> bool:
     return _ydotool_socket(env) is not None
 
 
+def _ydotool_escapes(runner=None) -> bool:
+    """探测 ydotool 是否支持 ``-e/--escape``（v1.0.4 起才有）。
+
+    v0.1.8（Debian 12 / Ubuntu 22.04/24.04）遇到 ``-e`` 直接报错退出；
+    v1.0.0–1.0.3 会把 ``0`` 当成待输入文本静默多敲一个字符。两种情况都
+    不能传 ``-e 0``，所以在后端初始化时探测一次并缓存。
+
+    探测失败（帮助信息读不到、进程异常、非 0 退出）一律按"不支持"处理：
+    宁可在含反斜杠/控制字符时拒绝输入，也不静默打错字。
+    """
+    run = runner or _run
+    try:
+        cp = run(["ydotool", "type", "--help"], capture_stdout=True)
+    except Exception:
+        return False
+    if getattr(cp, "returncode", 1) != 0:
+        return False
+    out = (getattr(cp, "stdout", "") or "").lower()
+    return "--escape" in out or "-e," in out
+
+
 class YdotoolBackend(Backend):
     """通过 ydotool（/dev/uinput）注入按键；仅支持 ASCII 字面量。
 
     ``ydotool type`` 默认开启反斜杠转义（``\\n``/``\\t``/``\\xNN`` 会被
     解码成真实控制字符），因此每次调用都显式传 ``-e 0``，把文本按字面量
     交给工具——否则会绕过 ``validate_payload`` 的控制字符拦截与多行确认。
+
+    ``-e`` 是 v1.0.4 才加入的选项：更老的版本要么报错退出（0.1.8），
+    要么把 ``0`` 当文本敲出去（1.0.0–1.0.3）。初始化时探测一次
+    ``ydotool type --help``，不支持就不传 ``-e``，并拒绝含反斜杠/控制
+    字符的文本（它们会被老版本按字面量输入或根本无转义，语义不可控）。
     """
 
     name = "ydotool"
@@ -699,6 +728,8 @@ class YdotoolBackend(Backend):
         self.delay = delay
         self.socket = socket
         self._run = runner or _run
+        # 每个后端实例只探测一次；--list-backends 复用同一个探测函数
+        self.escapes_supported = _ydotool_escapes(self._run)
 
     # ------------------------------------------------------------- 内部
     def _delay_args(self) -> list[str]:
@@ -743,9 +774,23 @@ class YdotoolBackend(Backend):
                 f"用 --backend wtype；绝不静默丢字。")
         if not text:
             return
+        if not self.escapes_supported:
+            bad = next((ch for ch in text
+                        if ch == "\\" or ord(ch) < 0x20 or ord(ch) == 0x7F),
+                       None)
+            if bad is not None:
+                raise Abort(
+                    f"当前 ydotool 版本不支持 -e/--escape，无法保证 {bad!r} "
+                    f"按字面量输入（旧版会转义或把 -e 的参数当文本）。\n"
+                    f"请升级 ydotool 到 >= 1.0.4，或改用 --backend wtype。")
         for chunk in _chunks(text, self.MAX_ARG):
-            # -e 0：关闭 ydotool 的反斜杠转义，文本必须按字面量发送。
-            self._exec(["type", *self._delay_args(), "-e", "0", "--", chunk])
+            if self.escapes_supported:
+                # -e 0：关闭 ydotool 的反斜杠转义，文本必须按字面量发送。
+                self._exec(["type", *self._delay_args(), "-e", "0", "--",
+                            chunk])
+            else:
+                # 老版本本来就没有转义功能，不能传它不认识的 -e。
+                self._exec(["type", *self._delay_args(), "--", chunk])
 
     def press(self, combo: str) -> None:
         mods, key = parse_combo(combo)
@@ -768,7 +813,8 @@ class YdotoolBackend(Backend):
         return {"name": self.name, "can_focus_info": False,
                 "can_paste_mode": False, "unicode": False,
                 "needs_remap": False, "combos": True,
-                "per_char_delay": True, "daemon": True}
+                "per_char_delay": True, "daemon": True,
+                "escapes_supported": self.escapes_supported}
 
 
 # ------------------------------------------------------------- 后端选择
@@ -1441,10 +1487,14 @@ def format_backends(env=None, which=None, runner=None) -> str:
     else:
         sock = _ydotool_socket(env)
         if sock:
+            esc = _ydotool_escapes(runner)
+            esc_note = ("，支持 -e（关闭转义）" if esc else
+                        "，不支持 -e（旧版 < 1.0.4：含反斜杠的文本会被拒绝；"
+                        "建议升级或改用 wtype）")
             rows.append(("ydotool", True,
                          "PATH=" + (which("ydotool") or "") +
                          f"，socket={sock}" +
-                         (f"，版本 {yver}" if yver else "")))
+                         (f"，版本 {yver}" if yver else "") + esc_note))
         else:
             rows.append(("ydotool", False,
                          "已安装但找不到 socket（ydotoold 未运行？）"))

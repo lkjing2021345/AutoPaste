@@ -36,6 +36,28 @@ class FakeRunner:
                                            self.stderr)
 
 
+class HelpRunner(FakeRunner):
+    """模拟 ydotool 的 ``type --help`` / ``--version`` 输出（版本差异化）。"""
+
+    OLD_HELP = "Usage: ydotool type [TEXT]...\n  -h [ --help ]  help\n"
+    NEW_HELP = ("Usage: ydotool type [OPTIONS] [TEXT]...\n"
+                "  -e, --escape=BOOL  enable escape sequences\n")
+
+    def __init__(self, help_stdout=None, version="ydotool 1.0.4\n", **kwargs):
+        super().__init__(**kwargs)
+        self.help_stdout = self.NEW_HELP if help_stdout is None else help_stdout
+        self.version = version
+
+    def __call__(self, argv, **kwargs):
+        cp = super().__call__(argv, **kwargs)
+        tail = list(argv[1:])
+        if tail == ["type", "--help"]:
+            return subprocess.CompletedProcess(argv, 0, self.help_stdout, "")
+        if tail == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, self.version, "")
+        return cp
+
+
 # ---------------------------------------------------------------- 会话探测
 class DetectSessionTests(unittest.TestCase):
     def test_xdg_session_type_x11(self):
@@ -276,11 +298,15 @@ class WtypeArgvTests(unittest.TestCase):
 
 # ---------------------------------------------------------------- ydotool
 class YdotoolTests(unittest.TestCase):
-    def make(self, delay=0.008, rc=0, stderr="", socket="/tmp/.ydotool_socket"):
-        runner = FakeRunner(rc=rc, stderr=stderr)
+    def make(self, delay=0.008, rc=0, stderr="", socket="/tmp/.ydotool_socket",
+             help_stdout=None):
+        runner = HelpRunner(help_stdout=help_stdout, rc=rc, stderr=stderr)
         backend = autopaste.YdotoolBackend(
             delay=delay, which=_which({"ydotool"}), env={}, runner=runner,
             socket=socket)
+        # 构造时的能力探测已记录在 calls 里，清掉以便断言注入 argv
+        runner.calls.clear()
+        runner.kwargs.clear()
         return backend, runner
 
     def test_type_argv_disables_escaping(self):
@@ -302,6 +328,59 @@ class YdotoolTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][-4:-2], ["-e", "0"])
         for ch in runner.calls[0][-1]:
             self.assertFalse(ord(ch) < 32 or ord(ch) == 127)
+
+    def test_probe_runs_once_at_init(self):
+        runner = HelpRunner()
+        autopaste.YdotoolBackend(which=_which({"ydotool"}), env={},
+                                 runner=runner,
+                                 socket="/tmp/.ydotool_socket")
+        probes = [c for c in runner.calls if c[1:] == ["type", "--help"]]
+        self.assertEqual(len(probes), 1)
+        backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), env={}, runner=runner,
+            socket="/tmp/.ydotool_socket")
+        backend.type_text("a")
+        backend.type_text("b")
+        probes = [c for c in runner.calls if c[1:] == ["type", "--help"]]
+        self.assertEqual(len(probes), 2)   # 两个实例各探测一次
+        self.assertTrue(backend.escapes_supported)
+
+    def test_old_ydotool_omits_escape_flag(self):
+        backend, runner = self.make(help_stdout=HelpRunner.OLD_HELP)
+        self.assertFalse(backend.escapes_supported)
+        backend.type_text("hello")
+        self.assertEqual(
+            runner.calls[0],
+            ["ydotool", "type", "--key-delay", "8", "--", "hello"])
+
+    def test_old_ydotool_rejects_backslash_text(self):
+        backend, runner = self.make(help_stdout=HelpRunner.OLD_HELP)
+        with self.assertRaises(autopaste.Abort) as ctx:
+            backend.type_text("echo a\\nrm -rf ~")
+        msg = str(ctx.exception)
+        self.assertIn("1.0.4", msg)
+        self.assertIn("升级", msg)
+        # 拒绝必须发生在调用 ydotool 之前（不能静默打错字）
+        self.assertEqual(runner.calls, [])
+
+    def test_old_ydotool_rejects_control_chars(self):
+        backend, runner = self.make(help_stdout=HelpRunner.OLD_HELP)
+        with self.assertRaises(autopaste.Abort):
+            backend.type_text("a\tb")
+        self.assertEqual(runner.calls, [])
+
+    def test_capabilities_reports_escape_support(self):
+        new_backend, _ = self.make()
+        old_backend, _ = self.make(help_stdout=HelpRunner.OLD_HELP)
+        self.assertTrue(new_backend.capabilities()["escapes_supported"])
+        self.assertFalse(old_backend.capabilities()["escapes_supported"])
+
+    def test_probe_failure_is_treated_as_unsupported(self):
+        runner = FakeRunner(rc=1)
+        backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), env={}, runner=runner,
+            socket="/tmp/.ydotool_socket")
+        self.assertFalse(backend.escapes_supported)
 
     def test_combo_uses_evdev_codes(self):
         backend, runner = self.make()
@@ -471,6 +550,19 @@ class CliBackendTests(unittest.TestCase):
         self.assertIn("ydotool", out)
         self.assertIn("当前会话: wayland", out)
         self.assertIn("auto 将选择: wtype", out)
+
+    def test_list_backends_reports_escape_support(self):
+        env = {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wl-0"}
+        with mock.patch.object(autopaste, "_ydotool_socket",
+                               return_value="/tmp/.ydotool_socket"):
+            new_out = autopaste.format_backends(
+                env=env, which=_which({"ydotool"}), runner=HelpRunner())
+            old_out = autopaste.format_backends(
+                env=env, which=_which({"ydotool"}),
+                runner=HelpRunner(help_stdout=HelpRunner.OLD_HELP))
+        self.assertIn("支持 -e", new_out)
+        self.assertIn("1.0.4", old_out)
+        self.assertIn("不支持 -e", old_out)
 
     def test_invalid_backend_exits_2(self):
         with redirect_std():
