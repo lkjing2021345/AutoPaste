@@ -13,6 +13,11 @@
     cat note.txt | autopaste -s 3 -    # 从管道读取，倒数后输入
     autopaste -k ctrl+alt+t            # 模拟组合键
     autopaste --dry-run "check me"     # 只预览、不真的敲键
+    autopaste --backend wtype "hi"     # 显式指定后端（auto|x11|wtype|ydotool）
+    autopaste --list-backends          # 查看各后端可用性与探测依据
+
+后端: X11 用 XTEST；Wayland 用 wtype（虚拟键盘协议）或 ydotool（/dev/uinput，
+仅 ASCII）。auto 规则: 真 X11 会话 -> x11；Wayland -> wtype -> ydotool。
 
 REPL 内命令:
     :s 3          每次回车后的倒计时（秒，0 = 不等待）
@@ -28,7 +33,8 @@ REPL 内命令:
 安全提示:
     * 本程序等价于"替你在键盘上打字"，请只在你能看到屏幕时使用。
     * 它拒绝以 root 身份运行（除非显式 --allow-root）。
-    * 多行文本打进终端 = 逐行执行命令，因此 CLI 模式下会二次确认。
+    * 多行文本打进终端 = 逐行执行命令，因此 CLI 模式下会二次确认；
+      Wayland 下读不到焦点窗口，所有多行输入一律要求确认（-y 可跳过）。
     * 完整威胁模型见 SECURITY.md。
 
 zsh 提示: 命令行参数里的 ! 会被历史展开，含 ! 的文本请用单引号，
@@ -595,6 +601,154 @@ class WtypeBackend(Backend):
                 "per_char_delay": True, "daemon": False}
 
 
+#: evdev keycode 表（ydotool key 用；只收常用键，未知键一律报错不猜）
+EVDEV = {
+    "esc": 1, "escape": 1,
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9,
+    "9": 10, "0": 11, "minus": 12, "equal": 13, "backspace": 14, "tab": 15,
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "i": 23,
+    "o": 24, "p": 25, "leftbrace": 26, "rightbrace": 27,
+    "enter": 28, "return": 28,
+    "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36, "k": 37,
+    "l": 38, "semicolon": 39, "apostrophe": 40, "grave": 41,
+    "z": 44, "x": 45, "c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
+    "comma": 51, "dot": 52, "period": 52, "slash": 53,
+    "asterisk": 55, "kpasterisk": 55, "space": 57, "capslock": 58,
+    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
+    "f7": 65, "f8": 66, "f9": 67, "f10": 68, "numlock": 69,
+    "scrolllock": 70, "f11": 87, "f12": 88,
+    "kp7": 71, "kp8": 72, "kp9": 73, "kpminus": 74, "kp4": 75, "kp5": 76,
+    "kp6": 77, "kpplus": 78, "kp1": 79, "kp2": 80, "kp3": 81, "kp0": 82,
+    "kpdot": 83, "102nd": 86,
+    "rightctrl": 97, "rightalt": 100,
+    "home": 102, "up": 103, "pageup": 104, "prior": 104,
+    "left": 105, "right": 106, "end": 107, "down": 108,
+    "pagedown": 109, "next": 109, "insert": 110, "delete": 111,
+    "mute": 113, "volumedown": 114, "volumeup": 115,
+    "leftmeta": 125, "super": 125, "win": 125, "meta": 125,
+}
+
+#: 修饰键名 -> evdev 码（与 MODIFIERS 的别名保持一致）
+EVDEV_MOD = {"ctrl": 29, "control": 29, "shift": 42, "alt": 56,
+             "super": 125, "win": 125, "meta": 125}
+
+
+def _ydotool_socket(env=None, exists=os.path.exists) -> str | None:
+    """按 ydotool 版本差异依次探测 socket。"""
+    env = os.environ if env is None else env
+    candidates = []
+    if env.get("YDOTOOL_SOCKET"):
+        candidates.append(env["YDOTOOL_SOCKET"])
+    if env.get("XDG_RUNTIME_DIR"):
+        candidates.append(os.path.join(env["XDG_RUNTIME_DIR"],
+                                       ".ydotool_socket"))
+    candidates.append("/tmp/.ydotool_socket")
+    for path in candidates:
+        if path and exists(path):
+            return path
+    return None
+
+
+def _ydotool_socket_ok(env=None) -> bool:
+    return _ydotool_socket(env) is not None
+
+
+class YdotoolBackend(Backend):
+    """通过 ydotool（/dev/uinput）注入按键；仅支持 ASCII。"""
+
+    name = "ydotool"
+    MAX_ARG = 32 * 1024
+
+    def __init__(self, delay: float = 0.008, *, which=None, env=None,
+                 runner=None, socket=None, exists=None):
+        env = os.environ if env is None else env
+        which = shutil.which if which is None else which
+        if not which("ydotool"):
+            raise BackendUnavailable(
+                "未找到 ydotool。\n" + _missing_hint("wayland"))
+        if socket is None:
+            socket = _ydotool_socket(env, exists or os.path.exists)
+        if not socket:
+            raise BackendUnavailable(
+                "ydotoold 未运行（找不到 socket）。先启动守护进程：\n"
+                "  systemctl --user enable --now ydotoold\n"
+                "若仍失败，检查 /dev/uinput 权限与当前用户的 input 组：\n"
+                "  sudo usermod -aG input $USER   # 或写 udev 规则给 /dev/uinput 0660\n"
+                "（本程序拒绝以 root 运行，权限必须授予你自己的用户。）")
+        self.delay = delay
+        self.socket = socket
+        self._run = runner or _run
+
+    # ------------------------------------------------------------- 内部
+    def _delay_args(self) -> list[str]:
+        ms = _delay_ms(self.delay)
+        return [] if ms == 0 else ["--key-delay", str(ms)]
+
+    def _exec(self, args: list[str]) -> None:
+        argv = ["ydotool", *args]
+        try:
+            cp = self._run(argv)
+        except FileNotFoundError:
+            raise BackendUnavailable(
+                "未找到 ydotool（PATH 可能不完整）。\n" + _missing_hint("wayland"))
+        rc = getattr(cp, "returncode", 0)
+        if rc != 0:
+            stderr = (getattr(cp, "stderr", "") or "").strip().splitlines()
+            err = stderr[-1][:200] if stderr else "无输出"
+            low = err.lower()
+            if ("uinput" in low or "permission denied" in low
+                    or "no such file" in low):
+                hint = ("（检查 /dev/uinput 权限：sudo usermod -aG input $USER，"
+                        "或写 udev 规则给 /dev/uinput 0660；然后重新登录）")
+            else:
+                hint = "（确认 ydotoold 正在运行：systemctl --user status ydotoold）"
+            raise BackendError(f"ydotool 失败（退出码 {rc}）：{err}{hint}")
+
+    def _keycode(self, key: str) -> int:
+        low = key.lower()
+        code = EVDEV_MOD.get(low, EVDEV.get(low))
+        if code is None:
+            raise Abort(f"ydotool 后端不支持按键 {key!r}，"
+                        f"请改用 --backend wtype 或 x11")
+        return code
+
+    # ------------------------------------------------------------- 注入
+    def type_text(self, text: str) -> None:
+        bad = next((ch for ch in text if ord(ch) > 0x7E), None)
+        if bad is not None:
+            raise Abort(
+                f"ydotool 无法可靠输入非 ASCII 字符（当前文本含 {bad!r}）。"
+                f"GNOME Wayland + 中文请用 X11 会话，或安装 wtype 后 "
+                f"用 --backend wtype；绝不静默丢字。")
+        if not text:
+            return
+        for chunk in _chunks(text, self.MAX_ARG):
+            self._exec(["type", *self._delay_args(), "--", chunk])
+
+    def press(self, combo: str) -> None:
+        mods, key = parse_combo(combo)
+        shift = len(key) == 1 and key.isupper()
+        keycode = self._keycode(key.lower() if shift else key)
+        codes = []
+        for mod in mods:
+            codes.append(f"{EVDEV_MOD[mod]}:1")
+        if shift:
+            codes.append(f"{EVDEV_MOD['shift']}:1")
+        codes.append(f"{keycode}:1")
+        codes.append(f"{keycode}:0")
+        if shift:
+            codes.append(f"{EVDEV_MOD['shift']}:0")
+        for mod in reversed(mods):
+            codes.append(f"{EVDEV_MOD[mod]}:0")
+        self._exec(["key", *self._delay_args(), *codes])
+
+    def capabilities(self) -> dict:
+        return {"name": self.name, "can_focus_info": False,
+                "can_paste_mode": False, "unicode": False,
+                "needs_remap": False, "combos": True,
+                "per_char_delay": True, "daemon": True}
+
+
 # ------------------------------------------------------------- 后端选择
 def detect_session(env=None) -> str:
     """返回 "x11" / "wayland" / "unknown"。
@@ -629,10 +783,12 @@ def _missing_hint(session: str) -> str:
         f"（本程序拒绝以 root 运行，权限必须授予你自己的用户。）")
 
 
-def choose_backend(requested: str = "auto", env=None, which=None) -> str:
+def choose_backend(requested: str = "auto", env=None, which=None,
+                   socket_ok=None) -> str:
     """把 --backend 的取值解析成具体后端名。"""
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
+    socket_ok = _ydotool_socket_ok if socket_ok is None else socket_ok
     if requested != "auto":
         return requested
     session = detect_session(env)
@@ -641,6 +797,8 @@ def choose_backend(requested: str = "auto", env=None, which=None) -> str:
     if session == "wayland":
         if which("wtype"):
             return "wtype"
+        if which("ydotool") and socket_ok(env):
+            return "ydotool"
     raise BackendUnavailable(_missing_hint(session))
 
 
@@ -652,6 +810,9 @@ def make_backend(name: str = "auto", *, delay: float = 0.008,
         return X11Backend(delay=delay, remap_wait=remap_wait)
     if resolved == "wtype":
         return WtypeBackend(delay=delay, which=which, env=env, runner=runner)
+    if resolved == "ydotool":
+        return YdotoolBackend(delay=delay, which=which, env=env,
+                              runner=runner)
     raise BackendUnavailable(f"未知后端: {resolved}")
 
 
@@ -1084,7 +1245,8 @@ def _num(s: str, lo: float, hi: float, what: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="autopaste",
-        description="把文本敲进当前聚焦的 X11 窗口（XTEST，零依赖）。"
+        description="把文本敲进当前聚焦的窗口（X11 用 XTEST，Wayland 用 "
+                    "wtype/ydotool，零第三方依赖）。"
                     "不带参数运行进入交互 REPL。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
@@ -1094,10 +1256,12 @@ def build_parser() -> argparse.ArgumentParser:
   autopaste -f note.txt -s 2         输入文件
   autopaste --dry-run 'x < y'        只预览，不敲键
   autopaste -k ctrl+shift+v          发送组合键
+  autopaste --backend wtype 'hi'     指定后端（Wayland）
+  autopaste --list-backends          查看后端可用性
 
 安全:
   * 默认拒绝 root 运行、拒绝控制字符（ESC 等）、拒绝 FIFO/设备文件；
-  * 多行文本打进终端会二次确认；
+  * 多行文本打进终端会二次确认（Wayland 下所有多行都确认）；
   * 详见 SECURITY.md。
 
 zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，或直接用 REPL 粘贴。
@@ -1119,9 +1283,9 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                     help="跳过确认提示（终端目标 + 多行文本时使用）")
     ap.add_argument("--allow-control", action="store_true",
                     help="允许输入控制字符（ESC 等），确认安全后再用")
-    ap.add_argument("--backend", choices=("auto", "x11", "wtype"),
+    ap.add_argument("--backend", choices=("auto", "x11", "wtype", "ydotool"),
                     default="auto",
-                    help="键盘注入后端：auto|x11|wtype，默认 auto")
+                    help="键盘注入后端：auto|x11|wtype|ydotool，默认 auto")
     ap.add_argument("--list-backends", action="store_true",
                     help="列出各后端可用性与探测依据后退出")
     ap.add_argument("--allow-root", action="store_true",
@@ -1208,12 +1372,28 @@ def format_backends(env=None, which=None, runner=None) -> str:
                      "PATH=" + (which("wtype") or "") +
                      (f"，版本 {wver}" if wver else "")))
 
+    yver = _tool_version("ydotool", which=which, runner=runner)
+    if yver is None:
+        rows.append(("ydotool", False, "未在 PATH 找到"))
+    else:
+        sock = _ydotool_socket(env)
+        if sock:
+            rows.append(("ydotool", True,
+                         "PATH=" + (which("ydotool") or "") +
+                         f"，socket={sock}" +
+                         (f"，版本 {yver}" if yver else "")))
+        else:
+            rows.append(("ydotool", False,
+                         "已安装但找不到 socket（ydotoold 未运行？）"))
+
     out = ["后端      可用  探测依据"]
     for name, ok, why in rows:
         out.append(f"{name:<9} {'是' if ok else '否'}    {why}")
     out.append(f"当前会话: {session}")
     try:
-        out.append(f"auto 将选择: {choose_backend('auto', env=env, which=which)}")
+        out.append("auto 将选择: "
+                   + choose_backend("auto", env=env, which=which,
+                                    socket_ok=_ydotool_socket_ok))
     except BackendUnavailable:
         out.append("auto 将选择: （无可用后端）")
     return "\n".join(out) + "\n"

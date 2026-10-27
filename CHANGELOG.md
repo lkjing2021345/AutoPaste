@@ -1,5 +1,19 @@
 # Changelog
 
+## 未发布
+
+### Added
+- 可插拔 `Backend` 抽象：`Typer` 退化为会话外观，X11 实现原样搬入 `X11Backend`。
+- Wayland 支持：`wtype`（虚拟键盘协议）与 `ydotool`（`/dev/uinput`，仅 ASCII）后端。
+- `--backend auto|x11|wtype|ydotool` 与 `--list-backends`（可用性、版本、探测依据）。
+- Wayland 会话的安装/权限诊断文案（ydotoold、`/dev/uinput`、发行版命令）。
+
+### Changed
+- libX11/libXtst 改为惰性加载：无 X 库的机器/CI 也能 `--help`、`--version`。
+- 移除"没有 DISPLAY 就退出"的硬检查，改为后端解析失败才退出 2。
+- Wayland 读不到焦点窗口：所有多行输入一律要求确认（`-y` 可跳过），比原先只拦终端更严。
+- 组合键解析提取为共享的 `parse_combo()`；Wayland 后端按 UTF-8 边界分片（≤32 KiB）避免 `E2BIG`。
+
 ## 1.0.0 — 2026-10-27
 
 首个公开发布版本。

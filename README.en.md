@@ -1,6 +1,6 @@
 # AutoPaste
 
-Type text into **any focused X11 window** by injecting keystrokes through the XTEST extension. Pure Python standard library — no `xdotool`, no root, no dependencies.
+Type text into **the focused window** by injecting keystrokes: XTEST on X11, `wtype` or `ydotool` on Wayland. Pure Python standard library — no third-party packages, no root.
 
 ```bash
 autopaste "hello world"        # type it into the focused window
@@ -14,7 +14,7 @@ Clipboard-based pasting fails in terminals that block it, in VMs/remote desktops
 
 ## Features
 
-- **Zero dependencies** — `ctypes` + `libX11` + `libXtst` only, no clipboard, no shell.
+- **Zero Python dependencies** — `ctypes` + `libX11`/`libXtst` on X11; on Wayland it execs `wtype`/`ydotool` with a fixed argv (never through a shell). No clipboard access.
 - **Any Unicode** — CJK, emoji, full-width punctuation (temporarily remaps a free keycode, then restores it).
 - **REPL with bracketed paste** — paste multi-line code without quoting/escaping anything.
 - **Key combos** — `-k ctrl+alt+t`, arrows, `F1`–`F12`, `Home`, `End`, …
@@ -28,7 +28,7 @@ git clone git@github.com:lkjing2021345/AutoPaste.git
 cd AutoPaste && ./install.sh     # symlink to ~/.local/bin/autopaste
 ```
 
-Requirements: Linux, X11 session, Python ≥ 3.8. Native Wayland is not supported (XTEST only reaches the X server); use `ydotool` there.
+Requirements: Linux, Python ≥ 3.8. X11 works out of the box; Wayland needs `wtype` (recommended; wlroots/KWin) or `ydotool` (GNOME; requires `ydotoold` and `/dev/uinput` access).
 
 ## CLI
 
@@ -38,6 +38,8 @@ Requirements: Linux, X11 session, Python ≥ 3.8. Native Wayland is not supporte
 | `-s, --sleep` | countdown before typing (REPL: default per submission) |
 | `-f, --file` | read payload from a regular file (max 1 MiB) |
 | `-n, --no-newline` | strip trailing newline of file/stdin payload |
+| `--backend` | `auto` \| `x11` \| `wtype` \| `ydotool` (default `auto`) |
+| `--list-backends` | show availability, versions and detection reasons |
 | `-k, --key` | key or combo, repeatable |
 | `--dry-run` | show target window and payload preview, send nothing |
 | `-y, --yes` | skip the "terminal + multi-line" confirmation |
@@ -52,7 +54,8 @@ Run without arguments. `:s <sec>` countdown, `:d <sec>` per-char delay, `:nl` to
 
 ## Limitations
 
-- X11 only (XWayland-hosted X clients work; native Wayland does not).
+- Wayland needs an external tool: `wtype` (compositor must support virtual-keyboard; GNOME/mutter does not) or `ydotool` (ASCII only, `ydotoold` + `/dev/uinput`).
+- The focused window cannot be inspected on Wayland, so every multi-line payload requires confirmation there.
 - Input methods (fcitx5/ibus) may swallow individual keys under some XIM apps — `export XMODIFIERS=` helps.
 - Follows the active keyboard layout; unmappable characters use a temporary keycode remap.
 

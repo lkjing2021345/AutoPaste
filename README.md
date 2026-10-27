@@ -33,7 +33,13 @@ pipx install .               # 推荐：装进独立环境，直接得到 autopa
 
 或者不安装，直接 `python3 autopaste.py ...`。
 
-要求：Linux + X11 会话 + Python ≥ 3.8。Wayland 原生会话不支持（XTEST 只作用于 X 服务器），可用 `ydotool` 之类的工具替代。
+要求：Linux + Python ≥ 3.8。X11 会话开箱即用；Wayland 会话需要 `wtype`（推荐，wlroots/KWin）或 `ydotool`（GNOME 等，需要 `ydotoold` 与 `/dev/uinput` 权限）：
+
+```bash
+sudo pacman -S wtype ydotool          # Arch
+sudo apt install wtype ydotool        # Debian/Ubuntu
+sudo dnf install wtype ydotool        # Fedora
+```
 
 ## 用法
 
@@ -48,6 +54,8 @@ cat note.txt | autopaste -s 3 -      # 从管道读取
 autopaste -k ctrl+alt+t              # 组合键
 autopaste -k ctrl+v -k enter         # 多个动作连发
 autopaste --dry-run "x < y"          # 只预览目标和内容，不敲键
+autopaste --backend wtype "hello"    # 显式指定后端（auto|x11|wtype|ydotool）
+autopaste --list-backends            # 查看各后端可用性、版本与探测依据
 ```
 
 | 参数 | 说明 |
@@ -102,13 +110,15 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 6. 输入上限 1 MiB、延时有上限，避免误喂 `yes`/超大管道；
 7. 只接受普通文件，不读 FIFO/设备文件；
 8. 异常/`Ctrl-C`/`SIGTERM` 时都会还原被临时改写的键盘映射，不在系统里留下坏键位；
-9. 不联网、不读剪贴板、不执行 shell、不写文件。
+9. 不联网、不读剪贴板、不写文件；Wayland 后端只以固定 argv 调用 `wtype`/`ydotool`
+   （不经 shell），X11 后端不启动任何外部进程。
 
 完整威胁模型与"本工具防不了什么"见 **[SECURITY.md](SECURITY.md)**。
 
 ## 已知限制
 
-- **只支持 X11**。Wayland 下 XTEST 不可用（XWayland 里的 X 客户端可以，但原生 Wayland 窗口不行）。
+- **Wayland 需外部工具**。X11 走 XTEST；Wayland 需 `wtype`（合成器需支持 virtual-keyboard 协议，GNOME/mutter 不支持）或 `ydotool`（内核层，但只支持 ASCII，且需要 `ydotoold` + `/dev/uinput` 权限）。
+- **Wayland 下看不到焦点窗口**，倒计时只显示"Wayland 会话"；因此所有多行输入都会要求确认。
 - **输入法（fcitx5/ibus）可能拦截个别按键**。之前排查到本机 `XMODIFIERS=@im=fcitx` 时，某些 XIM 程序会吞掉个别单键；遇到时 `export XMODIFIERS=` 再跑。
 - **依赖当前键盘布局**。程序按 keysym 找 keycode，切换布局后行为随之变化；找不到的字符会走临时重映射。
 - 少数程序用扫描码/原始设备事件（如部分游戏、反作弊），XTEST 注入不生效。

@@ -77,6 +77,21 @@ class ChooseBackendTests(unittest.TestCase):
                                      which=_which({"wtype", "ydotool"})),
             "wtype")
 
+    def test_auto_wayland_ydotool_when_only_ydotool(self):
+        env = {"XDG_SESSION_TYPE": "wayland"}
+        self.assertEqual(
+            autopaste.choose_backend("auto", env=env,
+                                     which=_which({"ydotool"}),
+                                     socket_ok=lambda e: True),
+            "ydotool")
+
+    def test_auto_skips_ydotool_without_socket(self):
+        env = {"XDG_SESSION_TYPE": "wayland"}
+        with self.assertRaises(autopaste.BackendUnavailable):
+            autopaste.choose_backend("auto", env=env,
+                                     which=_which({"ydotool"}),
+                                     socket_ok=lambda e: False)
+
     def test_auto_without_tools_raises_install_hint(self):
         with self.assertRaises(autopaste.BackendUnavailable) as ctx:
             autopaste.choose_backend(
@@ -209,6 +224,115 @@ class WtypeArgvTests(unittest.TestCase):
         self.assertFalse(caps["needs_remap"])
 
 
+# ---------------------------------------------------------------- ydotool
+class YdotoolTests(unittest.TestCase):
+    def make(self, delay=0.008, rc=0, stderr="", socket="/tmp/.ydotool_socket"):
+        runner = FakeRunner(rc=rc, stderr=stderr)
+        backend = autopaste.YdotoolBackend(
+            delay=delay, which=_which({"ydotool"}), env={}, runner=runner,
+            socket=socket)
+        return backend, runner
+
+    def test_type_argv(self):
+        backend, runner = self.make()
+        backend.type_text("hello")
+        self.assertEqual(runner.calls[0],
+                         ["ydotool", "type", "--key-delay", "8", "--", "hello"])
+
+    def test_combo_uses_evdev_codes(self):
+        backend, runner = self.make()
+        backend.press("ctrl+v")
+        self.assertEqual(
+            runner.calls[0],
+            ["ydotool", "key", "--key-delay", "8",
+             "29:1", "47:1", "47:0", "29:0"])
+
+    def test_combo_with_multiple_modifiers_and_special_key(self):
+        backend, runner = self.make()
+        backend.press("ctrl+alt+enter")
+        self.assertEqual(
+            runner.calls[0],
+            ["ydotool", "key", "--key-delay", "8",
+             "29:1", "56:1", "28:1", "28:0", "56:0", "29:0"])
+
+    def test_uppercase_combo_adds_shift(self):
+        backend, runner = self.make()
+        backend.press("ctrl+V")
+        self.assertEqual(
+            runner.calls[0],
+            ["ydotool", "key", "--key-delay", "8",
+             "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+
+    def test_unknown_key_aborts_instead_of_guessing(self):
+        backend, _ = self.make()
+        with self.assertRaises(autopaste.Abort) as ctx:
+            backend.press("ctrl+nosuchkey")
+        self.assertIn("ydotool", str(ctx.exception))
+
+    def test_rejects_non_ascii_text(self):
+        backend, runner = self.make()
+        with self.assertRaises(autopaste.Abort) as ctx:
+            backend.type_text("hello 中文")
+        msg = str(ctx.exception)
+        self.assertIn("ydotool", msg)
+        self.assertIn("非 ASCII", msg)
+        self.assertEqual(runner.calls, [])
+
+    def test_socket_from_env_var(self):
+        env = {"YDOTOOL_SOCKET": "/run/me/custom.sock"}
+        backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), env=env, runner=FakeRunner(),
+            exists=lambda p: p == "/run/me/custom.sock")
+        self.assertEqual(backend.socket, "/run/me/custom.sock")
+
+    def test_socket_probed_from_xdg_runtime_dir(self):
+        env = {"XDG_RUNTIME_DIR": "/run/user/1000"}
+        path = "/run/user/1000/.ydotool_socket"
+        backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), env=env, runner=FakeRunner(),
+            exists=lambda p: p == path)
+        self.assertEqual(backend.socket, path)
+
+    def test_socket_falls_back_to_tmp(self):
+        backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), env={"XDG_RUNTIME_DIR": "/run/user/1"},
+            runner=FakeRunner(),
+            exists=lambda p: p == "/tmp/.ydotool_socket")
+        self.assertEqual(backend.socket, "/tmp/.ydotool_socket")
+
+    def test_missing_socket_message_mentions_ydotoold(self):
+        with self.assertRaises(autopaste.BackendUnavailable) as ctx:
+            autopaste.YdotoolBackend(
+                which=_which({"ydotool"}), env={}, runner=FakeRunner(),
+                exists=lambda p: False)
+        self.assertIn("ydotoold", str(ctx.exception))
+
+    def test_missing_binary_raises_unavailable(self):
+        with self.assertRaises(autopaste.BackendUnavailable):
+            autopaste.YdotoolBackend(which=lambda name: None, env={},
+                                     runner=FakeRunner(),
+                                     socket="/tmp/.ydotool_socket")
+
+    def test_permission_error_hint_mentions_uinput(self):
+        backend, _ = self.make(
+            rc=1, stderr="failed to open /dev/uinput: Permission denied")
+        with self.assertRaises(autopaste.BackendError) as ctx:
+            backend.type_text("a")
+        self.assertIn("uinput", str(ctx.exception))
+
+    def test_nonzero_exit_without_stderr(self):
+        backend, _ = self.make(rc=1, stderr="")
+        with self.assertRaises(autopaste.BackendError):
+            backend.type_text("a")
+
+    def test_chunks_long_text(self):
+        backend, runner = self.make(delay=0.0)
+        text = "x" * (autopaste.YdotoolBackend.MAX_ARG + 1)
+        backend.type_text(text)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual("".join(call[-1] for call in runner.calls), text)
+
+
 # ---------------------------------------------------------------- 外观层
 class TyperFacadeTests(unittest.TestCase):
     def test_delay_setter_forwards_to_backend(self):
@@ -240,6 +364,7 @@ class TyperFacadeTests(unittest.TestCase):
         expected = {
             "x11": (True, True, False),
             "wtype": (False, True, False),
+            "ydotool": (False, False, True),
         }
         fake_x11 = FakeX11()
         with mock.patch.object(autopaste, "x11", fake_x11), \
@@ -249,8 +374,13 @@ class TyperFacadeTests(unittest.TestCase):
             x11_backend.close()
         wtype_backend = autopaste.WtypeBackend(
             which=_which({"wtype"}), runner=FakeRunner())
+        ydotool_backend = autopaste.YdotoolBackend(
+            which=_which({"ydotool"}), runner=FakeRunner(),
+            socket="/tmp/.ydotool_socket")
+        backends = {"x11": x11_caps, "wtype": wtype_backend.capabilities(),
+                    "ydotool": ydotool_backend.capabilities()}
         for name, (focus, uni, daemon) in expected.items():
-            caps = x11_caps if name == "x11" else wtype_backend.capabilities()
+            caps = backends[name]
             self.assertEqual(caps["name"], name)
             self.assertEqual(caps["can_focus_info"], focus, name)
             self.assertEqual(caps["unicode"], uni, name)
@@ -274,6 +404,7 @@ class CliBackendTests(unittest.TestCase):
             runner=FakeRunner(rc=1))
         self.assertIn("x11", out)
         self.assertIn("wtype", out)
+        self.assertIn("ydotool", out)
         self.assertIn("当前会话: wayland", out)
         self.assertIn("auto 将选择: wtype", out)
 
