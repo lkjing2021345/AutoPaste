@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 语法检查
+        run: python -m py_compile autopaste.py
+      - name: 命令行可用性（不触碰 X11）
+        run: |
+          python autopaste.py --version
+          python autopaste.py --help > /dev/null
+      - name: 校验文档中引用的文件都存在
+        run: |
+          for f in LICENSE README.md README.en.md SECURITY.md CHANGELOG.md install.sh; do
+            test -f "$f" || { echo "缺少 $f"; exit 1; }
+          done
