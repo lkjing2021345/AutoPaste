@@ -67,6 +67,7 @@ import ctypes
 import ctypes.util
 import dataclasses
 import json
+import math
 import os
 import re
 import select
@@ -2798,10 +2799,14 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True,
     quiet = LOG.level == Log.QUIET
     if quiet:
         # --quiet 只压成一行，但目标窗口与"可取消"必须保留（安全可视化）
-        tail = f"｜{int(seconds)}s 后可取消（任意键取消）" if cancelable \
-            else f"｜{int(seconds)}s 后开始"
+        tail = f"｜{max(1, math.ceil(seconds))}s 后可取消（任意键取消）" \
+            if cancelable else f"｜{max(1, math.ceil(seconds))}s 后开始"
         stream.write(f"目标 {target}{tail}\n")
         stream.flush()
+    try:
+        stdin_is_tty = sys.stdin.isatty()
+    except Exception:
+        stdin_is_tty = False
     end = time.time() + seconds
     try:
         while True:
@@ -2812,19 +2817,31 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True,
                 tail = "（按任意键取消）" if cancelable else ""
                 stream.write(f"\r  目标 {target}  {left:4.1f}s {tail}   ")
                 stream.flush()
+            if not cancelable:
+                # stdin 已 EOF：select 会恒可读，绝不能再轮询空转。
+                time.sleep(min(0.1, max(left, 0.0)))
+                continue
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if r and cancelable:
-                try:
-                    data = os.read(sys.stdin.fileno(), 1024)
-                except OSError:
-                    data = b""
-                if data:
-                    stream.write("\r" + " " * 70 + "\r  已取消\r\n"
-                                 if not quiet else "  已取消\n")
-                    return False
-                # EOF（如 `cat note.txt | autopaste -s 3 -`）：stdin 再也
-                # 变不出按键，停止监听，但倒计时必须照常走完。
-                cancelable = False
+            if not r:
+                continue
+            try:
+                data = os.read(sys.stdin.fileno(), 1024)
+            except OSError:
+                data = b""
+            if data:
+                stream.write("\r" + " " * 70 + "\r  已取消\r\n"
+                             if not quiet else "  已取消\n")
+                return False
+            if stdin_is_tty:
+                # canonical tty 的 Ctrl-D（VEOF）只返回 0 字节，并不关闭
+                # stdin。把它当一次按键取消：此后不能再"监听但忽略按键"，
+                # 否则终端里的 Ctrl-D/任意键都会失效（R_04 M1）。
+                stream.write("\r" + " " * 70 + "\r  已取消\r\n"
+                             if not quiet else "  已取消\n")
+                return False
+            # 管道/普通文件 EOF（如 `cat note.txt | autopaste -s 3 -`）：
+            # stdin 再也变不出按键，摘掉监听，倒计时照常走完。
+            cancelable = False
     except KeyboardInterrupt:
         stream.write("\r" + " " * 70 + "\r  已取消\r\n" if not quiet
                      else "  已取消\n")

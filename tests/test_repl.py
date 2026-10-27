@@ -3,6 +3,8 @@
 
 import io
 import os
+import select
+import time
 import unittest
 from unittest import mock
 
@@ -146,6 +148,51 @@ class CountdownEofTests(unittest.TestCase):
         with mock.patch.object(autopaste.sys, "stdin", raw), \
                 redirect_std() as (_, err):
             ok = autopaste.countdown(5.0, typer, cancelable=True)
+        self.assertFalse(ok)
+        self.assertIn("已取消", err.getvalue())
+
+    def test_eof_stops_polling_instead_of_busy_waiting(self):
+        """管道 EOF 后不能再每轮 select 空转（R_04 M2）。"""
+        raw = self._eof_stdin()
+        calls = []
+        real_select = select.select
+
+        def counting(*args, **kwargs):
+            calls.append(args)
+            return real_select(*args, **kwargs)
+
+        with mock.patch.object(autopaste.sys, "stdin", raw), \
+                mock.patch.object(autopaste.select, "select",
+                                  side_effect=counting), \
+                redirect_std():
+            started = time.time()
+            ok = autopaste.countdown(0.4, ReplTyper(), cancelable=True)
+        elapsed = time.time() - started
+        self.assertTrue(ok)
+        self.assertGreaterEqual(elapsed, 0.35)
+        # 修复前 0.4s 会调用成百上千次；修复后 EOF 只探测一次。
+        self.assertLessEqual(len(calls), 2)
+
+    def test_tty_ctrl_d_cancels_countdown(self):
+        """canonical tty 的 Ctrl-D 返回 0 字节但不关闭 stdin（R_04 M1）。"""
+        raw = self._eof_stdin()
+        stdin = FakeTTY(raw)
+        with mock.patch.object(autopaste.sys, "stdin", stdin), \
+                redirect_std() as (_, err):
+            ok = autopaste.countdown(5.0, ReplTyper(), cancelable=True)
+        self.assertFalse(ok)
+        self.assertIn("已取消", err.getvalue())
+
+    def test_tty_keypress_still_cancels_countdown(self):
+        rfd, wfd = os.pipe()
+        os.write(wfd, b"x")
+        os.close(wfd)
+        raw = os.fdopen(rfd, "r")
+        self.addCleanup(raw.close)
+        stdin = FakeTTY(raw)
+        with mock.patch.object(autopaste.sys, "stdin", stdin), \
+                redirect_std() as (_, err):
+            ok = autopaste.countdown(5.0, ReplTyper(), cancelable=True)
         self.assertFalse(ok)
         self.assertIn("已取消", err.getvalue())
 
