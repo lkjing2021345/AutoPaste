@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/lkjing2021345/AutoPaste/security/advisories/new
+    about: 请勿公开披露可利用的安全问题，使用私密漏洞报告。
+  - name: 使用文档
+    url: https://github.com/lkjing2021345/AutoPaste/blob/main/docs/README.md
+    about: 参数、后端、REPL 与故障排查。

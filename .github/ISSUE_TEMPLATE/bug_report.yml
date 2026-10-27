@@ -1,0 +1,57 @@
+name: Bug report
+description: 报告一个可复现的问题（Wayland 问题请务必附后端诊断）
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        安全漏洞请不要开公开 issue，走 [SECURITY.md](../blob/main/SECURITY.md) 里的私密渠道。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: "`autopaste --version` 的输出"
+      placeholder: autopaste 1.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: session
+    attributes:
+      label: 会话类型
+      options:
+        - X11
+        - Wayland（wtype）
+        - Wayland（ydotool）
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: backends
+    attributes:
+      label: 后端诊断
+      description: "`autopaste --list-backends` 的完整输出（会包含 DISPLAY/socket 路径，请自行脱敏）"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: dryrun
+    attributes:
+      label: dry-run 输出
+      description: "`autopaste --dry-run ...` 的完整输出（已脱敏）"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤与期望行为
+    validations:
+      required: true
+  - type: input
+    id: exitcode
+    attributes:
+      label: 退出码
+      description: "`echo $?`，见 docs/cli.md 的退出码表"
+      placeholder: "2"
+    validations:
+      required: false
