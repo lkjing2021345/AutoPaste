@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import KEYSYM_SHIFT, FakeX11, FakeXtst, redirect_std
+from support import KEYSYM_SHIFT, FakeX11, FakeXtst, redirect_std, temp_home
 
 
 def _which(names):
@@ -580,7 +580,8 @@ class CliBackendTests(unittest.TestCase):
                 mock.patch.object(autopaste.shutil, "which",
                                   return_value=None), \
                 redirect_std() as (_, err):
-            code = autopaste.main(["--backend", "wtype", "hi"])
+            with temp_home():
+                code = autopaste.main(["--backend", "wtype", "hi"])
         self.assertEqual(code, 2)
         self.assertIn("wtype", err.getvalue())
 
@@ -588,7 +589,8 @@ class CliBackendTests(unittest.TestCase):
         return mock.patch.object(autopaste, "Typer")
 
     def test_wayland_multiline_requires_confirm(self):
-        with self._mock_wayland_typer() as typer_cls, \
+        with temp_home(), \
+                self._mock_wayland_typer() as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 mock.patch.object(autopaste, "_confirm",
@@ -606,7 +608,8 @@ class CliBackendTests(unittest.TestCase):
         typer_cls.return_value.type_text.assert_not_called()
 
     def test_wayland_multiline_with_yes_proceeds(self):
-        with self._mock_wayland_typer() as typer_cls, \
+        with temp_home(), \
+                self._mock_wayland_typer() as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 redirect_std():

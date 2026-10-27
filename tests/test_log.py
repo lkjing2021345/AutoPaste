@@ -8,7 +8,7 @@ from unittest import mock
 
 import autopaste
 import test_repl
-from support import redirect_std
+from support import redirect_std, temp_home
 
 
 class QuietReplTests(unittest.TestCase):
@@ -79,7 +79,8 @@ class QuietCountdownTests(unittest.TestCase):
                 "needs_remap": True, "combos": True,
                 "per_char_delay": True, "daemon": False,
                 "window_control": False}
-        with mock.patch.object(autopaste, "Typer") as typer_cls, \
+        with temp_home(), \
+                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
@@ -102,7 +103,8 @@ class QuietCountdownTests(unittest.TestCase):
                 "per_char_delay": True, "daemon": False,
                 "window_control": False}
         log = autopaste.Log(autopaste.Log.VERBOSE, err=io.StringIO())
-        with mock.patch.object(autopaste, "Typer") as typer_cls, \
+        with temp_home(), \
+                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \

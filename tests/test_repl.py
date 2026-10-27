@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import FakeX11, FakeXtst, redirect_std  # noqa: F401
+from support import redirect_std, temp_home
 
 
 class FakeTTY:

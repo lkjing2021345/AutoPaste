@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import redirect_std
+from support import redirect_std, temp_home
 
 
 def _registered_handlers(signal_mock):
@@ -80,7 +80,8 @@ class EntryPointTests(unittest.TestCase):
             # 模拟外部 SIGTERM 到达：走真实注册的 handler
             _registered_handlers(sig)[signal.SIGTERM](signal.SIGTERM, None)
 
-        with mock.patch.object(autopaste.signal, "signal") as sig, \
+        with temp_home(), \
+                mock.patch.object(autopaste.signal, "signal") as sig, \
                 mock.patch.object(autopaste, "Typer", FakeTyper), \
                 mock.patch.object(autopaste, "atexit") as atexit_mock, \
                 mock.patch.object(autopaste, "countdown", fake_countdown), \

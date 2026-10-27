@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest import mock
 
-from support import redirect_std
+from support import redirect_std, temp_home
 
 import autopaste
 
@@ -225,7 +225,8 @@ class MainPasteTests(unittest.TestCase):
                         "per_char_delay": True, "daemon": False,
                         "window_control": True}
         factory = mock.Mock(return_value=None if clip_missing else clip)
-        with mock.patch.object(autopaste, "Typer") as typer_cls, \
+        with temp_home(), \
+                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \

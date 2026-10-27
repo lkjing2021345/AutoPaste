@@ -9,6 +9,8 @@ import contextlib
 import ctypes
 import io
 import os
+import tempfile
+from unittest import mock
 
 import autopaste
 
@@ -337,6 +339,17 @@ class FakeXtst:
         self.log.record("tap", keycode, bool(is_press))
         self.delays.append(delay)
         return 1
+
+
+@contextlib.contextmanager
+def temp_home():
+    """临时 HOME/XDG 目录：保证测试不读真实 ~/.config/autopaste/config.toml。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {"HOME": tmp,
+               "XDG_CONFIG_HOME": os.path.join(tmp, "config"),
+               "XDG_STATE_HOME": os.path.join(tmp, "state")}
+        with mock.patch.dict(os.environ, env):
+            yield tmp
 
 
 @contextlib.contextmanager

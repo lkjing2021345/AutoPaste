@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import EventLog, FakeX11, FakeXtst, redirect_std
+from support import EventLog, FakeX11, FakeXtst, redirect_std, temp_home
 
 
 class SpeedBase(unittest.TestCase):
@@ -153,7 +153,8 @@ class FallbackTests(SpeedBase):
         self.assertEqual(self.x11.flush_count, 2)
 
     def test_safe_flag_disables_batch(self):
-        with mock.patch.object(autopaste, "Typer") as typer_cls, \
+        with temp_home(), \
+                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 mock.patch.object(autopaste, "countdown",
                                   return_value=True), \
                 redirect_std():

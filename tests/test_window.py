@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import EventLog, FakeX11, FakeXtst, redirect_std
+from support import EventLog, FakeX11, FakeXtst, redirect_std, temp_home
 
 
 class WindowBase(unittest.TestCase):
@@ -326,7 +326,8 @@ class MainWindowTests(unittest.TestCase):
                         "per_char_delay": True, "daemon": False,
                         "window_control": True}
         windows = [self.kitty, self.other] if windows is None else windows
-        with mock.patch.object(autopaste, "Typer") as typer_cls, \
+        with temp_home(), \
+                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \

@@ -6,14 +6,15 @@ import unittest
 from unittest import mock
 
 import autopaste
-from support import redirect_std
+from support import redirect_std, temp_home
 
 
 class BuildParserTests(unittest.TestCase):
     def test_defaults(self):
         args = autopaste.build_parser().parse_args([])
         self.assertEqual(args.text, [])
-        self.assertAlmostEqual(args.delay, 0.008)
+        self.assertIsNone(args.delay)      # 默认值由 resolve_settings 填回
+        self.assertIsNone(args.backend)
         self.assertIsNone(args.sleep)
         self.assertIsNone(args.file)
         self.assertEqual(args.key, [])
@@ -35,7 +36,8 @@ class BuildParserTests(unittest.TestCase):
 class MainExitCodeTests(unittest.TestCase):
     def _main(self, argv, env, mock_typer=True):
         self.typer_cls = None
-        with mock.patch.dict(os.environ, env, clear=False), \
+        with temp_home(), \
+                mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
                 redirect_std() as (out, err):
@@ -97,7 +99,8 @@ class MainExitCodeTests(unittest.TestCase):
         self.assertIn("未发送任何按键", out)
 
     def test_root_rejected(self):
-        with mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+        with temp_home(), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(os, "geteuid", return_value=0,
                                   create=True), \
                 redirect_std() as (_, err):

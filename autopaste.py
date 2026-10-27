@@ -19,6 +19,10 @@
     autopaste --window class:kitty "hi"# 定向窗口并校验焦点（X11）
     autopaste --paste-mode -f big.txt  # 大段文本：写剪贴板 + 一次粘贴键
     autopaste --dry-run --window class:kitty "hi"  # 只预览，不激活/不碰剪贴板
+    autopaste -q -s 3 "hi"             # 静默：只留一行目标窗口提示（仍可取消）
+    autopaste -v --dry-run "hi"        # 诊断：配置来源/后端/capabilities
+    autopaste --config ./my.toml "hi"  # 指定配置文件（默认 XDG_CONFIG_HOME）
+    autopaste --no-history             # REPL 不读写历史文件
 
 后端: X11 用 XTEST；Wayland 用 wtype（虚拟键盘协议）或 ydotool（/dev/uinput，
 仅 ASCII）。auto 规则: 真 X11 会话 -> x11；Wayland -> wtype -> ydotool。
@@ -30,7 +34,11 @@ REPL 内命令:
     :k ctrl+v     发送组合键（同样先倒计时）
     :f note.txt   输入文件内容
     :r            重复上一次提交的内容
-    :t            查看当前设置与目标窗口
+    :t            查看当前设置（含来源）与目标窗口
+    :p            预览上一次提交的内容（不发按键）
+    :w <文件>     把上一次提交的内容保存到文件（0600）
+    :win <模式>   设置定向窗口（:win - 清除）
+    ↑ / ↓         历史（行内前缀搜索，↓ 回到草稿）
     :h            帮助
     :q            退出
 
@@ -39,7 +47,12 @@ REPL 内命令:
     * 它拒绝以 root 身份运行（除非显式 --allow-root）。
     * 多行文本打进终端 = 逐行执行命令，因此 CLI 模式下会二次确认；
       Wayland 下读不到焦点窗口，所有多行输入一律要求确认（-y 可跳过）。
+    * REPL 历史默认写入 XDG state 目录（0600，明文）；粘贴敏感内容请用
+      --no-history。配置文件不能设置任何安全开关。
     * 完整威胁模型见 SECURITY.md。
+
+退出码: 0 成功 / 1 内容或数值校验失败 / 2 用法、配置、环境或安全拒绝 /
+        3 用户在安全确认处取消 / 130 中断。
 
 zsh 提示: 命令行参数里的 ! 会被历史展开，含 ! 的文本请用单引号，
           或直接在 REPL 里粘贴（没有转义问题）。
@@ -80,6 +93,21 @@ HIST_MAX_ENTRIES = 300
 HIST_MAX_ENTRY_BYTES = 8 * 1024
 HIST_MAX_ENTRY_LINES = 200
 HIST_MAX_FILE_BYTES = 1 << 20
+
+# ----------------------------------------------------------------- 配置常量
+DEFAULT_DELAY = 0.008
+DEFAULT_SLEEP_REPL = 2.0
+CONFIG_MAX_BYTES = 64 * 1024
+CONFIG_KEYS = {
+    "delay":      ("float", 0.0, MAX_DELAY),
+    "sleep":      ("float", 0.0, MAX_COUNTDOWN),
+    "backend":    ("enum", ("auto", "x11", "wtype", "ydotool")),
+    "auto_enter": ("bool", None, None),
+    "paste_mode": ("bool", None, None),
+}
+#: 安全开关只能命令行指定；出现在配置文件里一律硬拒绝（退出 2）
+FORBIDDEN_KEYS = {"allow_root", "allow_control", "yes", "no_restore_clipboard"}
+_SRC_LABEL = {"cli": "命令行", "config": "配置", "default": "默认"}
 
 # ----------------------------------------------------------------- 窗口常量
 WINDOW_ACTIVATE_TIMEOUT = 1.5    # 激活后轮询焦点确认的总时长（秒）
@@ -328,6 +356,12 @@ class WindowCancelled(Abort):
 
 class ClipboardUnsafe(Abort):
     """剪贴板无法安全备份，拒绝覆盖（退出码 2）"""
+
+    code = 2
+
+
+class ConfigError(Abort):
+    """配置文件语法/权限/禁止键（退出码 2）"""
 
     code = 2
 
@@ -2028,6 +2062,18 @@ def _entry_lines(text: str) -> int:
     return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
+def _read_limited(fd: int, limit: int) -> bytes:
+    chunks = []
+    left = limit
+    while left > 0:
+        chunk = os.read(fd, min(left, 65536))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        left -= len(chunk)
+    return b"".join(chunks)
+
+
 def default_history_path(env=None) -> str | None:
     """$XDG_STATE_HOME/autopaste/history；环境不完整时返回 None（仅内存）。"""
     env = os.environ if env is None else env
@@ -2104,15 +2150,7 @@ class History:
 
     @staticmethod
     def _read_fd(fd: int, limit: int) -> bytes:
-        chunks = []
-        left = limit
-        while left > 0:
-            chunk = os.read(fd, min(left, 65536))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            left -= len(chunk)
-        return b"".join(chunks)
+        return _read_limited(fd, limit)
 
     # ---- 读写实现
     def _load(self) -> None:
@@ -2497,14 +2535,248 @@ class LineEditor:
             self._render(prompt)
 
 
+# ------------------------------------------------------------------ 配置文件
+def default_config_path(env=None) -> str | None:
+    env = os.environ if env is None else env
+    base = env.get("XDG_CONFIG_HOME") or ""
+    if base:
+        if not os.path.isabs(base):
+            return None
+    else:
+        home = env.get("HOME")
+        if not home or not os.path.isabs(home):
+            return None
+        base = os.path.join(home, ".config")
+    return os.path.join(base, "autopaste", "config.toml")
+
+
+class Config:
+    """扁平配置的解析结果；None 表示"未配置"（由命令行/默认值决定）。"""
+
+    __slots__ = ("delay", "sleep", "backend", "auto_enter", "paste_mode",
+                 "path")
+
+    def __init__(self):
+        self.delay = None
+        self.sleep = None
+        self.backend = None
+        self.auto_enter = None
+        self.paste_mode = None
+        self.path = None
+
+    def provided(self) -> list:
+        return [k for k in self.__slots__
+                if k != "path" and getattr(self, k) is not None]
+
+
+def _strip_comment(line: str) -> str:
+    """去掉行尾注释；引号内的 # 不是注释。"""
+    out = []
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            out.append(ch)
+            if quote == '"' and ch == "\\" and i + 1 < len(line):
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        else:
+            if ch in "\"'":
+                quote = ch
+                out.append(ch)
+            elif ch == "#":
+                break
+            else:
+                out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _config_value(raw: str, path: str, lineno: int):
+    def bad(why):
+        raise ConfigError(f"{path}:{lineno}: {why}")
+
+    if raw.startswith('"'):
+        if len(raw) < 2 or not raw.endswith('"'):
+            bad("字符串缺少结束引号")
+        inner = raw[1:-1]
+        out = []
+        i = 0
+        mapping = {"\\": "\\", '"': '"', "n": "\n", "t": "\t"}
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\":
+                if i + 1 >= len(inner):
+                    bad("字符串以反斜杠结尾")
+                nxt = inner[i + 1]
+                if nxt not in mapping:
+                    bad(f"不支持的转义 \\{nxt}")
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if ch == '"':
+                bad("字符串内有未转义的引号")
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    if raw.startswith("'"):
+        if len(raw) < 2 or not raw.endswith("'"):
+            bad("字符串缺少结束引号")
+        inner = raw[1:-1]
+        if "'" in inner:
+            bad("单引号字符串内不能再有单引号")
+        return inner
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    if raw.startswith("[") or raw.startswith("{"):
+        bad("不支持数组/内联表")
+    if re.match(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$", raw):
+        return float(raw)
+    bad(f"无法解析的值 {raw!r}")
+
+
+def parse_config_text(text: str, *, path: str = "<config>") -> Config:
+    """解析"扁平 TOML 子集"；所有错误都带 path:行号。"""
+    cfg = Config()
+    cfg.path = path
+    seen = set()
+    section_seen = False
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = _strip_comment(line).strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if not line.endswith("]"):
+                raise ConfigError(f"{path}:{lineno}: 段头缺少 ]")
+            name = line[1:-1].strip()
+            if name != "autopaste":
+                raise ConfigError(f"{path}:{lineno}: 不支持的段 [{name}]")
+            if section_seen:
+                raise ConfigError(f"{path}:{lineno}: 重复的段 [autopaste]")
+            section_seen = True
+            continue
+        if "=" not in line:
+            raise ConfigError(f"{path}:{lineno}: 缺少 =")
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        raw = raw.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            # allow-root / no-restore-clipboard 这类拼写变体也在这里被拒
+            raise ConfigError(f"{path}:{lineno}: 非法键名 {key!r}")
+        if key in FORBIDDEN_KEYS or key.startswith("allow"):
+            raise ConfigError(
+                f"{path}:{lineno}: 配置不允许设置 {key}"
+                f"（安全相关选项必须显式命令行指定）")
+        if key in seen:
+            raise ConfigError(f"{path}:{lineno}: 重复的键 {key}")
+        seen.add(key)
+        value = _config_value(raw, path, lineno)
+        if key not in CONFIG_KEYS:
+            LOG.warn(f"未知配置项 {key}，已忽略")
+            continue
+        spec = CONFIG_KEYS[key]
+        kind = spec[0]
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise ConfigError(f"{path}:{lineno}: {key} 需要 true/false")
+        elif kind == "float":
+            lo, hi = spec[1], spec[2]
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise ConfigError(f"{path}:{lineno}: {key} 需要数字")
+            if not lo <= value <= hi:
+                raise ConfigError(
+                    f"{path}:{lineno}: {key} 超出范围 [{lo}, {hi}]")
+        elif kind == "enum":
+            allowed = spec[1]
+            if not isinstance(value, str) or value not in allowed:
+                raise ConfigError(
+                    f"{path}:{lineno}: {key} 只能是 {'/'.join(allowed)}")
+        setattr(cfg, key, value)
+    return cfg
+
+
+def load_config(path=None, *, env=None, euid=None) -> "Config | None":
+    """读取配置；默认路径不存在 -> None，显式路径不存在/不安全 -> ConfigError。"""
+    env = os.environ if env is None else env
+    euid = os.geteuid() if euid is None else euid
+    explicit = path is not None
+    if path is None:
+        path = default_config_path(env)
+        if path is None:
+            return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if explicit:
+            raise ConfigError(f"配置文件不存在: {path}")
+        return None
+    except OSError as e:
+        raise ConfigError(f"无法读取配置文件 {path}: {e}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfigError(f"配置文件不是普通文件: {path}")
+        if st.st_uid != euid:
+            raise ConfigError(f"配置文件不属于当前用户: {path}")
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            raise ConfigError(f"配置文件对组/其他用户可写: {path}")
+        if st.st_size > CONFIG_MAX_BYTES:
+            raise ConfigError(f"配置文件过大（上限 {CONFIG_MAX_BYTES} 字节）")
+        raw = _read_limited(fd, CONFIG_MAX_BYTES)
+    finally:
+        os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConfigError(f"配置文件不是 UTF-8: {path}")
+    return parse_config_text(text, path=path)
+
+
+def resolve_settings(args, cfg) -> dict:
+    """命令行 > 配置 > 默认；返回 {名字: (值, 来源)}。"""
+
+    def pick(name, cli, default):
+        if cli is not None:
+            return (cli, "cli")
+        value = getattr(cfg, name, None) if cfg is not None else None
+        if value is not None:
+            return (value, "config")
+        return (default, "default")
+
+    cli_paste = bool(getattr(args, "paste_mode", False))
+    cfg_paste = bool(cfg.paste_mode) if cfg is not None else False
+    if cli_paste:
+        paste = (True, "cli")
+    elif cfg_paste:
+        paste = (True, "config")
+    else:
+        paste = (False, "default")
+    return {
+        "delay": pick("delay", getattr(args, "delay", None), DEFAULT_DELAY),
+        "sleep": pick("sleep", getattr(args, "sleep", None), None),
+        "backend": pick("backend", getattr(args, "backend", None), "auto"),
+        "auto_enter": pick("auto_enter", None, False),
+        "paste_mode": paste,
+    }
+
+
 # ------------------------------------------------------------------ 交互界面
 class Settings:
     def __init__(self, sleep: float = 2.0, delay: float = 0.008,
-                 auto_enter: bool = False, window: str | None = None):
+                 auto_enter: bool = False, window: str | None = None,
+                 delay_src: str = "default", sleep_src: str = "default"):
         self.sleep = sleep
         self.delay = delay
         self.auto_enter = auto_enter
         self.window = window
+        self.delay_src = delay_src
+        self.sleep_src = sleep_src
 
 
 def countdown(seconds: float, typer: Typer, cancelable: bool = True,
@@ -2651,6 +2923,9 @@ def _cmd_save(arg: str, last: str | None) -> str:
             f"0600）")
 
 
+REPL_TTY_MSG = ("REPL 需要交互式终端（stdin 不是 tty）；"
+                "管道/文件输入请用 `autopaste -` 或 `-f`。")
+
 BANNER = """\
 autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任何引号/转义问题
   :s 3 倒计时 | :d 0.02 每字间隔 | :nl 自动回车 | :k 组合键 | :f 文件
@@ -2680,8 +2955,16 @@ HELP = """\
 
 def repl(typer: Typer, cfg: Settings,
          history: "History | None" = None) -> int:
+    if not sys.stdin.isatty():
+        LOG.error(REPL_TTY_MSG)
+        return 2
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    try:
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except termios.error as e:
+        LOG.error(f"无法进入交互模式（termios: {e}）")
+        return 2
     ed = LineEditor(fd, history=None if history is None else history.entries)
     last: str | None = None
     #: 本轮提交实际激活的目标窗口（None = 不定向，敲当前焦点）
@@ -2735,7 +3018,6 @@ def repl(typer: Typer, cfg: Settings,
             pass
 
     try:
-        tty.setcbreak(fd)
         sys.stdout.write("\x1b[?2004h")     # 打开终端的括号粘贴
         sys.stdout.flush()
         while True:
@@ -2767,8 +3049,11 @@ def repl(typer: Typer, cfg: Settings,
                         sys.stdout.write(HELP)
                     elif name == "t":
                         sys.stdout.write(
-                            f"  倒计时={cfg.sleep}s  字符间隔={cfg.delay}s  "
-                            f"自动回车={'开' if cfg.auto_enter else '关'}\n"
+                            f"  倒计时={cfg.sleep}s"
+                            f"（{_SRC_LABEL.get(cfg.sleep_src, cfg.sleep_src)}）"
+                            f"  字符间隔={cfg.delay}s"
+                            f"（{_SRC_LABEL.get(cfg.delay_src, cfg.delay_src)}）"
+                            f"  自动回车={'开' if cfg.auto_enter else '关'}\n"
                             f"  定向窗口={cfg.window or '（当前焦点）'}\n"
                             f"  当前目标={target_label(typer)}\n")
                     elif name == "win":
@@ -2784,8 +3069,10 @@ def repl(typer: Typer, cfg: Settings,
                         LOG.info(_cmd_save(arg, last))
                     elif name == "s":
                         cfg.sleep = _num(arg, 0.0, MAX_COUNTDOWN, "倒计时")
+                        cfg.sleep_src = "cli"
                     elif name == "d":
                         cfg.delay = _num(arg, 0.0, MAX_DELAY, "字符间隔")
+                        cfg.delay_src = "cli"
                         typer.delay = cfg.delay
                     elif name == "nl":
                         cfg.auto_enter = not cfg.auto_enter
@@ -2904,6 +3191,9 @@ def build_parser() -> argparse.ArgumentParser:
   autopaste --list-windows           列出可定向窗口
   autopaste --window class:firefox 'hi'  定向窗口（X11，校验焦点）
   autopaste --paste-mode -f big.txt  剪贴板直贴大段文本
+  autopaste -q -s 3 'hi'             静默：只留一行目标提示
+  autopaste -v --dry-run 'hi'        诊断：配置来源/后端/耗时
+  autopaste --config ./my.toml 'hi'  指定配置文件
 
 安全:
   * 默认拒绝 root 运行、拒绝控制字符（ESC 等）、拒绝 FIFO/设备文件；
@@ -2914,8 +3204,9 @@ def build_parser() -> argparse.ArgumentParser:
 zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，或直接用 REPL 粘贴。
 """)
     ap.add_argument("text", nargs="*", help="要输入的文本；'-' 表示从 stdin 读取")
-    ap.add_argument("-d", "--delay", type=float, default=0.008,
-                    help="每个字符之间的延时秒数，默认 0.008，上限 5")
+    ap.add_argument("-d", "--delay", type=float, default=None,
+                    help="每个字符之间的延时秒数，默认 0.008（可被配置文件覆盖），"
+                         "上限 5")
     ap.add_argument("-s", "--sleep", type=float, default=None,
                     help="开始前倒计时秒数（REPL 中为每次提交的默认值）")
     ap.add_argument("-f", "--file", help="从文件读取内容（仅普通文件）")
@@ -2933,8 +3224,9 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
     ap.add_argument("--allow-control", action="store_true",
                     help="允许输入控制字符（ESC 等），确认安全后再用")
     ap.add_argument("--backend", choices=("auto", "x11", "wtype", "ydotool"),
-                    default="auto",
-                    help="键盘注入后端：auto|x11|wtype|ydotool，默认 auto")
+                    default=None,
+                    help="键盘注入后端：auto|x11|wtype|ydotool，默认 auto"
+                         "（可被配置文件覆盖）")
     ap.add_argument("--list-backends", action="store_true",
                     help="列出各后端可用性与探测依据后退出")
     ap.add_argument("--window", metavar="PATTERN",
@@ -2960,6 +3252,11 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                    help="静默模式：只保留倒计时目标行、风险提示与错误")
     ap.add_argument("--no-history", action="store_true",
                     help="不读写 REPL 历史文件（默认保存到 XDG state 目录）")
+    ap.add_argument("--config", metavar="PATH", default=None,
+                    help="显式指定配置文件（默认 XDG_CONFIG_HOME/autopaste/"
+                         "config.toml）")
+    ap.add_argument("--no-config", action="store_true",
+                    help="不读取任何配置文件，全部使用默认值")
     ap.add_argument("--allow-root", action="store_true",
                     help="允许以 root 运行（不推荐）")
     ap.add_argument("-V", "--version", action="version",
@@ -3092,10 +3389,42 @@ def main(argv: list[str] | None = None) -> int:
                   "如确有需要，请显式加 --allow-root。")
         return 2
 
+    # ---- 配置：root 闸门之后（allow_root 永不可配置）
+    try:
+        cfg_file = None if args.no_config else load_config(args.config)
+    except ConfigError as e:
+        LOG.error(f"已拦截: {e}")
+        return 2
+    if args.no_config:
+        LOG.detail("配置: 已用 --no-config 跳过")
+    elif cfg_file is None:
+        LOG.detail("配置: 未找到，使用默认值")
+    else:
+        LOG.detail(f"配置: {cfg_file.path}（{len(cfg_file.provided())} 项）")
+    R = resolve_settings(args, cfg_file)
+
+    # ---- 命令行值校验：来源为 cli 时才需要类型/范围检查（配置已在加载时校验）
+    try:
+        delay = (_num(str(R["delay"][0]), 0.0, MAX_DELAY, "字符间隔")
+                 if R["delay"][1] == "cli" else R["delay"][0])
+        sleep = (None if R["sleep"][0] is None else
+                 (_num(str(R["sleep"][0]), 0.0, MAX_COUNTDOWN, "倒计时")
+                  if R["sleep"][1] == "cli" else R["sleep"][0]))
+    except Abort as e:
+        LOG.error(f"{e}")
+        return 1
+    backend = R["backend"][0]
+    paste_mode = bool(R["paste_mode"][0])
+    args.delay = delay                       # send_text 的耗时估算读它
+    LOG.detail(
+        f"参数: delay={delay}（{_SRC_LABEL.get(R['delay'][1], R['delay'][1])}）"
+        f" sleep={sleep}（{_SRC_LABEL.get(R['sleep'][1], R['sleep'][1])}）"
+        f" backend={backend}（{_SRC_LABEL.get(R['backend'][1], R['backend'][1])}）")
+
     # ---- --list-windows：只读枚举，不激活、不注入
     if args.list_windows:
         try:
-            typer = Typer(backend=args.backend)
+            typer = Typer(backend=backend)
             try:
                 caps = typer.capabilities()
                 if not caps.get("window_control"):
@@ -3124,25 +3453,24 @@ def main(argv: list[str] | None = None) -> int:
             LOG.error(f"已拦截: {e}")
             return e.code
 
-    try:
-        delay = _num(str(args.delay), 0.0, MAX_DELAY, "字符间隔")
-        sleep = 0.0 if args.sleep is None else _num(
-            str(args.sleep), 0.0, MAX_COUNTDOWN, "倒计时")
-    except Abort as e:
-        LOG.error(f"{e}")
-        return 1
-
     interactive = args.repl or (not args.text and not args.file
                                 and not args.key and sys.stdin.isatty())
+    if not interactive and sleep is None:
+        sleep = 0.0                 # CLI 默认不倒计时，REPL 默认 2s
 
     try:
         if interactive:
+            if not sys.stdin.isatty():
+                LOG.error(REPL_TTY_MSG)
+                return 2
             if args.paste_mode:
                 LOG.error("--paste-mode 目前只支持命令行模式"
                           "（REPL 内请用 :k 或直接粘贴）。")
                 return 1
-            cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
-                           delay=delay, window=args.window)
+            cfg = Settings(
+                sleep=(DEFAULT_SLEEP_REPL if sleep is None else sleep),
+                delay=delay, window=args.window,
+                delay_src=R["delay"][1], sleep_src=R["sleep"][1])
             history = None
             if not args.no_history:
                 history = History(default_history_path())
@@ -3150,17 +3478,23 @@ def main(argv: list[str] | None = None) -> int:
                     LOG.detail(
                         f"历史: {history.path}（载入 {len(history.entries)} 条，"
                         f"跳过 {history.skipped} 条损坏）")
-            typer = Typer(backend=args.backend, delay=cfg.delay)
+            typer = Typer(backend=backend, delay=cfg.delay)
             return repl(typer, cfg, history=history)
 
         # ---- 组装输入
         if args.file:
             check_regular_file(args.file)
-            with open(args.file, "r", encoding="utf-8",
-                      errors="replace") as f:
-                payload = f.read()
+            try:
+                with open(args.file, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    payload = f.read()
+            except OSError as e:
+                raise Abort(f"无法读取文件: {e}") from None
         elif args.text == ["-"]:
-            data = sys.stdin.buffer.read(MAX_PAYLOAD + 1)
+            try:
+                data = sys.stdin.buffer.read(MAX_PAYLOAD + 1)
+            except OSError as e:
+                raise Abort(f"无法读取 stdin: {e}") from None
             if len(data) > MAX_PAYLOAD:
                 raise Abort(f"stdin 内容超过上限 {MAX_PAYLOAD} 字节")
             payload = data.decode("utf-8", "replace")
@@ -3177,9 +3511,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         # ---- paste-mode 的参数契约（在任何注入/剪贴板操作之前）
-        if args.paste_key and not args.paste_mode:
+        if args.paste_key and not paste_mode:
             raise Abort("--paste-key 只能在 --paste-mode 下使用。")
-        if args.paste_mode:
+        if paste_mode:
             if user_keys:
                 raise Abort("--paste-mode 不能与 -k 组合键混用。")
             if len(args.key) != 1:
@@ -3196,15 +3530,15 @@ def main(argv: list[str] | None = None) -> int:
         for item in args.key:
             validate_payload(item, args.allow_control)
 
-        typer = Typer(backend=args.backend, delay=delay)
+        typer = Typer(backend=backend, delay=delay)
         caps = typer.capabilities()
         LOG.detail(f"后端: {caps.get('name')} capabilities: {caps}")
         LOG.detail(f"会话: {detect_session()}")
         if args.safe:
             typer.backend.batch_enabled = False
-        if args.paste_mode and not caps.get("combos"):
+        if paste_mode and not caps.get("combos"):
             raise BackendUnavailable(
-                f"当前后端 {args.backend} 不支持组合键，无法使用 --paste-mode。")
+                f"当前后端 {backend} 不支持组合键，无法使用 --paste-mode。")
 
         # ---- --window：先解析目标（只读），激活留到确认之后
         target = None
@@ -3243,7 +3577,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 sys.stdout.write(
                     "（该后端自带键盘映射，跳过字符可映射性检查）\n")
-            if args.paste_mode:
+            if paste_mode:
                 info = target_info
                 if info is None:
                     try:
@@ -3288,7 +3622,7 @@ def main(argv: list[str] | None = None) -> int:
             return 3
 
         # ---- paste-mode：唯一一次剪贴板写入发生在倒计时与焦点复核之后
-        if args.paste_mode:
+        if paste_mode:
             if args.no_clipboard_backup:
                 LOG.warn("--no-clipboard-backup：不备份/不恢复剪贴板，"
                          "原内容会被覆盖。")
@@ -3312,18 +3646,15 @@ def main(argv: list[str] | None = None) -> int:
         LOG.detail(f"已发送 {len(joined)} 字符 / {_entry_lines(joined)} 行，"
                    f"用时 {dt:.2f}s（{rate:.1f} 字/秒）")
         return 0
-    except (WindowUnavailable, WindowCancelled) as e:
-        LOG.error(f"{e}")
-        return e.code
-    except BackendUnavailable as e:
-        LOG.error(f"{e}")
-        return 2
-    except BackendError as e:
-        LOG.error(f"已拦截: {e}")
-        return 1
     except Abort as e:
-        LOG.error(f"已拦截: {e}")
-        return e.code
+        # 退出码只由异常类决定（BackendUnavailable/ConfigError=2，
+        # WindowCancelled=3，其余 1）；不做字符串匹配。
+        if isinstance(e, (WindowUnavailable, WindowCancelled,
+                          BackendUnavailable)):
+            LOG.error(f"{e}")
+        else:
+            LOG.error(f"已拦截: {e}")
+        return getattr(e, "code", 1)
     except KeyboardInterrupt:
         LOG.error("\n已中断。")
         return 130
@@ -3359,6 +3690,16 @@ def console_main(argv: list[str] | None = None) -> int:
         # main() 内部已把中断转成 130；这里兜住 argparse 等更早的位置。
         LOG.error("\n已中断。")
         return 130
+    except BrokenPipeError:
+        # `--list-backends | head`：读端关了不是错误；顺手把 stdout 指向
+        # /dev/null，否则解释器退出时的最后一次 flush 还会再抛一次。
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except (OSError, ValueError):
+            pass
+        return 0
 
 
 if __name__ == "__main__":

@@ -16,7 +16,10 @@ autopaste                      # 交互 REPL：粘贴多行文本，零转义
 
 - **零依赖**：只用 `ctypes` 调 `libX11` / `libXtst`，不经过剪贴板，也不依赖 `xdotool`。
 - **任意 Unicode**：中文、emoji、全角标点都能输入（内部临时重映射一个空闲 keycode，输完还原）。
-- **REPL 模式**：支持终端括号粘贴，粘进来的多行文本原样输入，不用管引号、`!`、`$`、反引号。
+- **REPL 模式**：支持终端括号粘贴，粘进来的多行文本原样输入，不用管引号、`!`、`$`、反引号；
+  `↑`/`↓` 取回历史（行内前缀搜索）、`:p` 预览、`:w` 保存到文件。
+- **可配置、可静默**：`~/.config/autopaste/config.toml` 设置默认值；
+  `-q/--quiet` 只保留目标窗口与风险提示，`-v/--verbose` 输出诊断。
 - **组合键**：`-k ctrl+alt+t`、`-k ctrl+shift+v`、方向键 / F1~F12 / Home / End 等。
 - **目标可见**：倒计时期间会显示"即将输入到哪个窗口"，避免敲错地方。
 - **定向窗口**：`--window class:firefox` 按 WM_CLASS/标题/PID 选中窗口并校验焦点；
@@ -64,6 +67,10 @@ autopaste --list-windows             # 列出可定向的窗口（TSV，可 grep
 autopaste --window class:firefox "hi"  # 定向到 Firefox（X11 里还会校验焦点）
 autopaste --paste-mode -f big.txt    # 大段文本：写剪贴板 + 一次粘贴键
 autopaste --paste-mode --dry-run -f big.txt  # 只预览，不碰剪贴板
+autopaste -q -s 3 "文本"              # 静默：只留一行目标窗口提示
+autopaste -v --dry-run "hi"          # 诊断：配置来源/后端/capabilities
+autopaste --no-history               # REPL 不读写历史文件
+autopaste --config ./my.toml "hi"    # 指定配置文件
 ```
 
 `--window` 的 pattern 默认是**大小写不敏感子串**（匹配 WM_CLASS/instance/标题），
@@ -83,7 +90,7 @@ autopaste --paste-mode --dry-run -f big.txt  # 只预览，不碰剪贴板
 
 | 参数 | 说明 |
 |---|---|
-| `-d, --delay 秒` | 每个字符之间的间隔，默认 `0.008`，上限 5 |
+| `-d, --delay 秒` | 每个字符之间的间隔，默认 `0.008`（可被配置文件覆盖），上限 5 |
 | `-s, --sleep 秒` | 开始前倒计时；REPL 中作为每次提交的默认值 |
 | `-f, --file 路径` | 从文件读取（仅普通文件，上限 1 MiB） |
 | `-n, --no-newline` | 去掉文件/stdin 结尾的换行 |
@@ -100,17 +107,24 @@ autopaste --paste-mode --dry-run -f big.txt  # 只预览，不碰剪贴板
 | `--paste-key COMBO` | 覆盖粘贴快捷键（默认按目标自动选） |
 | `--paste-wait 秒` | 粘贴后等待目标取走内容的秒数（默认按体积 0.5–3s） |
 | `--no-clipboard-backup` | 不备份/不恢复剪贴板（默认备份失败即停止） |
+| `-v, --verbose` | 输出诊断（配置来源、后端、capabilities、耗时）；与 `-q` 互斥 |
+| `-q, --quiet` | 静默：只保留倒计时目标行、风险提示、确认与错误 |
+| `--config PATH` | 显式指定配置文件 |
+| `--no-config` | 不读取配置文件 |
+| `--no-history` | 不读写 REPL 历史文件（连目录都不创建） |
 | `-V, --version` | 版本号 |
 
 ### 退出码
 
-| 码 | 含义 |
-|---|---|
-| 0 | 成功（含 `--list-windows`/`--dry-run`） |
-| 1 | 参数错误、控制字符/安全检查拦截 |
-| 2 | 环境不可用（无后端/无窗口能力）或找不到/无法激活目标窗口、剪贴板无法安全备份 |
-| 3 | 用户取消，或倒计时结束时焦点已离开 `--window` 目标 |
-| 130 | 被 `Ctrl-C`/`SIGINT`/`SIGTERM` 中断 |
+| 码 | 含义 | 典型场景 |
+|---|---|---|
+| 0 | 成功 | 注入完成、`--dry-run`、`--list-backends`、`--help/--version`、REPL 正常退出、管道被 `head` 关闭 |
+| 1 | 内容/数值校验失败 | `--delay 99`、`--sleep -1`、控制字符、超过 1 MiB、文件读不出来、`:w` 路径非法 |
+| 2 | 用法/配置/环境/安全拒绝 | argparse 未知选项/缺值/互斥冲突、root、无可用后端、配置文件语法/权限/安全键、`--repl` 非 tty |
+| 3 | 用户在安全确认处取消 | 多行确认回 `n`、窗口候选里按 `q`、倒计时后焦点已离开 |
+| 130 | 中断 | `Ctrl-C`/`SIGINT`/`SIGTERM`、倒计时被按键取消 |
+
+`argparse` 自身的用法错误（未知选项、缺值、`-q` 与 `-v` 同给）也统一退 **2**。
 
 支持的特殊键名：`enter` `tab` `esc` `backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `up` `down` `left` `right` `space` `f1`~`f12`，修饰键 `ctrl` `alt` `shift` `super`/`win`/`meta`（wtype 后端会把 `super`/`win`/`meta` 映射成它认识的 `logo`）。文本中的 `\n` 按回车，`\t` 按 Tab（REPL 粘贴的真实换行/Tab；`ydotool` 后端下反斜杠只是字面字符，不做转义解码）。
 
@@ -134,11 +148,42 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 | `:k ctrl+v` | 发送组合键（同样先倒计时） |
 | `:f note.txt` | 输入文件内容 |
 | `:r` | 重复上一次提交的内容 |
-| `:t` | 显示当前设置与目标窗口 |
-| `:w <pattern>` | 设置/查看定向窗口，`:w -` 清除 |
+| `:t` | 显示当前设置（含来源）、目标窗口 |
+| `:p` | 预览上一次提交的内容（转义显示，不发任何按键） |
+| `:w <文件>` | 把上一次提交的内容保存到文件（0600，拒绝符号链接/非普通文件） |
+| `:win <pattern>` | 设置定向窗口（`class:`/`title:`/`pid:`/`id:`/`re:`），`:win -` 清除 |
 | `:h` / `:q` | 帮助 / 退出 |
 
 行编辑：方向键、`Home`/`End`、`Backspace`/`Delete`、`Ctrl-U`、`Ctrl-W`、`Ctrl-C` 取消、`Ctrl-D` 退出。
+
+- `↑`/`↓`（或 `Ctrl-P`/`Ctrl-N`）翻历史；按 `↑` 时行内已有的内容作为**前缀过滤器**
+  （先输 `:s` 再 `↑` 只会找回 `:s ...`）。`↓` 回到开始翻之前的草稿。
+- 多行历史条目以 `[历史 N 字符 / M 行]` 折叠显示，回车原样重发、退格清除。
+- 历史保存在 `$XDG_STATE_HOME/autopaste/history`（默认 `~/.local/state/autopaste/history`），
+  文件 0600、目录 0700，只保留最近 300 条；`--no-history` 完全不读写。
+  **历史里是明文**，粘贴过令牌/密码请用 `--no-history`。
+
+### 配置文件
+
+`~/.config/autopaste/config.toml`（或 `$XDG_CONFIG_HOME/autopaste/config.toml`）：
+
+```toml
+delay = 0.02          # 每个字符间隔（0–5）
+sleep = 2.5           # 倒计时；REPL 与 CLI 都生效
+backend = "wtype"     # auto | x11 | wtype | ydotool
+auto_enter = false    # 仅 REPL：提交后自动回车
+paste_mode = false    # 仅 CLI：默认用剪贴板直贴
+```
+
+- 只支持这个**扁平子集**（注释、可选的 `[autopaste]` 段头、字符串/布尔/数字），
+  数组、日期、多行字符串一律报错（带 `路径:行号`）。
+- 优先级：**命令行 > 配置文件 > 默认值**；REPL 的 `:s`/`:d`/`:nl` 只改本次会话，不回写。
+- `allow_root`/`allow_control`/`yes`/`no_restore_clipboard` 等安全开关**不允许**出现在
+  配置里（含 `allow-root` 这类拼写变体），出现即退出 2。
+- 配置文件必须属于当前用户、不可被组/其他用户写、不能是符号链接，否则退出 2
+  （不会静默忽略被篡改的配置）。
+- `paste_mode = true` 只是把默认发送方式切成剪贴板直贴，剪贴板备份失败/非文本等
+  fail-closed 闸门全部照旧。
 
 ## 安全设计
 
@@ -152,7 +197,8 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 6. 输入上限 1 MiB、延时有上限，避免误喂 `yes`/超大管道；
 7. 只接受普通文件，不读 FIFO/设备文件；
 8. 异常/`Ctrl-C`/`SIGTERM` 时都会还原被临时改写的键盘映射，不在系统里留下坏键位；
-9. 不联网、不写文件；Wayland 后端只以固定 argv 调用 `wtype`/`ydotool`
+9. 不联网；除 REPL 历史文件、显式 `:w <文件>` 与配置文件读取外不写文件；
+   Wayland 后端只以固定 argv 调用 `wtype`/`ydotool`
    （不经 shell），X11 后端不启动外部进程。唯一的例外是显式 `--paste-mode`：
    它会调用 `xclip`/`xsel`/`wl-copy` 读写**系统剪贴板**（先备份、贴完恢复；
    剪贴板管理器仍可能留存历史），以及 `--window` 会在确认后主动激活目标窗口。
@@ -177,6 +223,8 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
   本工具无法检测"是否贴上"，建议先 `--dry-run` 确认目标。
 - **批量注入中断后**最多还会送出约 250ms 已排队的按键（无法撤回）；对时序敏感
   的场合用 `--safe` 或调大 `--delay`。
+- **REPL 历史会落盘**：提交过的文本（含命令）写进 0600 的历史文件，可被本用户、
+  备份/同步工具读取；不需要就加 `--no-history`。
 
 ## 故障排查
 

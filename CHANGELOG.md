@@ -19,13 +19,44 @@
 - `--paste-wait`（按体积默认 0.5–3s）与 `--no-clipboard-backup`
   （别名 `--no-restore-clipboard`）。
 - `tools/bench.py`：不依赖真实焦点窗口的事件发送基准。
+- REPL 历史：JSONL 持久化到 `$XDG_STATE_HOME/autopaste/history`（0600，最多
+  300 条、单条 ≤8 KiB/200 行）；`↑`/`↓`（`Ctrl-P`/`Ctrl-N`）翻阅、行内前缀
+  搜索、`↓` 回到草稿；多行条目折叠回忆。`--no-history` 完全不读写。
+  目录/文件权限、属主、符号链接任一不安全即禁用历史并降级为内存。
+- REPL `:p`：复用 `--dry-run` 的转义规则预览上一次内容（字符数/行数/预计
+  耗时/目标/多行风险），不发送任何按键；`:w <文件>`：原子写入（0600，拒绝
+  符号链接/目录/FIFO/设备）。
+- `-v/--verbose`、`-q/--quiet` 与统一的 `Log` 出口：stdout 只放用户请求的数据，
+  诊断/警告/倒计时一律 stderr；`--quiet` 保留单行目标提示、可取消，且不静默
+  风险提示/确认/错误。
+- 配置文件 `~/.config/autopaste/config.toml`（`$XDG_CONFIG_HOME` 优先），支持
+  扁平 TOML 子集 `delay/sleep/backend/auto_enter/paste_mode`；优先级
+  **命令行 > 配置 > 默认**。安全键（`allow_root`/`allow_control`/`yes`/
+  `no_restore_clipboard` 及 `allow-*` 变体）出现即退出 2；文件必须属主正确、
+  非组/其他可写、非符号链接，否则退出 2。
+- `--config PATH` / `--no-config`。
 
 ### Fixed
+- REPL 定向窗口（`:win`）在倒计时结束后**复核焦点**：焦点离开则跳过本次输入
+  并提示，与 CLI 一致；此前可能把内容盲打进当前窗口。
+- 倒计时在 stdin 已 EOF（如 `cat note.txt | autopaste -s 3 -`）时不再把 EOF
+  当作按键取消，倒计时正常走完（仍是 130 的只有真正的按键/信号取消）。
 - `ydotool type` 固定传 `-e 0`：反斜杠文本按字面量发送，不再被解码成 `\n`/`\t`/`\xNN`，从而绕过控制字符与多行确认两道闸门。
 - `wtype` 修饰键名映射：`super`/`win`/`meta` → `logo`，未知修饰键在发送前直接拒绝。
 - GNOME 下 `auto` 优先选 `ydotool`；wtype 报协议不支持时明确提示 `--backend ydotool`，不静默重试。
 
 ### Changed
+- 退出码统一为 5 个：0 成功、1 内容/数值校验失败、2 用法/配置/环境/安全拒绝
+  （含 argparse 自身与 `--repl` 非 tty）、3 安全确认处取消、130 中断；
+  `main()` 的异常收口改为 `except Abort` + `e.code`。
+- `-d/--delay` 与 `--backend` 的 argparse 默认值改为 `None`，由
+  `resolve_settings()` 按"命令行 > 配置 > 默认"填回（`-s` 原本就是 `None`）。
+- `--repl` 在非 tty 下明确退出 2（不再 traceback）；`-f`/stdin 的 `OSError`
+  转为"无法读取文件/stdin"（退出 1）；`--list-backends | head` 的
+  `BrokenPipeError` 安静退出 0，不再打印 "Exception ignored"。
+- REPL 窗口指令由 `:w` 改名为 **`:win`**，`:w` 现在表示"保存到文件"。
+- 倒计时与诊断输出从 stdout 移到 stderr（`--dry-run`、`--list-backends`、
+  `:p`、`:t`、`--help` 等用户请求的数据仍在 stdout）。
 - libX11/libXtst 改为惰性加载：无 X 库的机器/CI 也能 `--help`、`--version`。
 - 移除"没有 DISPLAY 就退出"的硬检查，改为后端解析失败才退出 2。
 - Wayland 读不到焦点窗口：所有多行输入一律要求确认（`-y` 可跳过），比原先只拦终端更严。
