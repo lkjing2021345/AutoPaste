@@ -85,6 +85,22 @@ SKIP_WINDOW_TYPES = {
     "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", "_NET_WM_WINDOW_TYPE_POPUP_MENU",
 }
 
+# ----------------------------------------------------------------- 剪贴板常量
+CLIP_READ_TIMEOUT = 1.0      # 读剪贴板超时
+CLIP_WRITE_TIMEOUT = 2.0     # 写剪贴板超时
+CLIP_SETTLE = 0.08           # 等 selection owner 生效
+MAX_CLIP_BACKUP = 4 << 20    # 4 MiB；超过就认为无法安全备份
+MAX_PASTE_WAIT = 10.0
+#: 这些终端用 Shift+Insert 粘贴（Ctrl+Shift+V 不生效）
+PASTE_SHIFT_INSERT = {
+    "xterm", "uxterm", "urxvt", "rxvt", "st", "st-256color", "termite",
+}
+#: 能安全当作文本备份的 clipboard targets（大小写不敏感精确匹配）
+TEXT_TARGETS = {
+    "utf8_string", "string", "text", "text/plain", "text/plain;charset=utf-8",
+    "text/plain;charset=utf8", "text/html", "text/x-moz-url",
+}
+
 # 会把换行当"执行"的终端程序（按 WM_CLASS，小写比较）
 TERMINAL_CLASSES = {
     "xterm", "uxterm", "urxvt", "rxvt", "alacritty", "kitty", "wezterm",
@@ -295,6 +311,10 @@ class ClipboardUnsafe(Abort):
     """剪贴板无法安全备份，拒绝覆盖（退出码 2）"""
 
     code = 2
+
+
+class ClipboardError(Exception):
+    """剪贴板读写失败（尚未按粘贴键时，调用方可降级为逐字符）。"""
 
 
 def _char_keysym(ch: str) -> int:
@@ -1534,6 +1554,229 @@ def make_backend(name: str = "auto", *, delay: float = 0.008,
     raise BackendUnavailable(f"未知后端: {resolved}")
 
 
+# ------------------------------------------------------------------ 剪贴板
+def _clip_run(argv, *, timeout=CLIP_READ_TIMEOUT, input_data=None):
+    """剪贴板命令的唯一出口（argv 直传，绝不经过 shell）。"""
+    return subprocess.run(argv, input=input_data, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False,
+                          timeout=timeout)
+
+
+def _out_bytes(cp) -> bytes:
+    out = getattr(cp, "stdout", b"") or b""
+    return out.encode("utf-8") if isinstance(out, str) else out
+
+
+def _out_text(cp) -> str:
+    out = getattr(cp, "stdout", b"") or b""
+    return out if isinstance(out, str) else out.decode("utf-8", "replace")
+
+
+def _clip_stderr(cp) -> str:
+    err = getattr(cp, "stderr", b"") or b""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    return " ".join(err.strip().splitlines())[:200] or "无输出"
+
+
+class Clipboard:
+    """剪贴板提供者：读/写/列 targets。失败抛 ClipboardError。"""
+
+    name = "?"
+
+    def targets(self) -> list[str] | None:
+        return None
+
+    def read(self) -> bytes:
+        raise ClipboardError("没有可用的剪贴板工具")
+
+    def write(self, data: bytes) -> None:
+        raise ClipboardError("没有可用的剪贴板工具")
+
+
+class CommandClipboard(Clipboard):
+    def __init__(self, name: str, *, read_argv, write_argv,
+                 targets_argv=None, runner=None):
+        self.name = name
+        self.read_argv = list(read_argv)
+        self.write_argv = list(write_argv)
+        self.targets_argv = list(targets_argv) if targets_argv else None
+        self._runner = runner or _clip_run
+
+    def _run(self, argv, *, timeout, input_data=None):
+        try:
+            return self._runner(argv, timeout=timeout, input_data=input_data)
+        except subprocess.TimeoutExpired:
+            raise ClipboardError(f"{self.name} 超时（{timeout}s）")
+        except FileNotFoundError:
+            raise ClipboardError(f"{self.name} 不在 PATH 中")
+        except OSError as e:
+            raise ClipboardError(f"{self.name} 执行失败: {e}")
+
+    def targets(self) -> list[str] | None:
+        if not self.targets_argv:
+            return None
+        cp = self._run(self.targets_argv, timeout=CLIP_READ_TIMEOUT)
+        if getattr(cp, "returncode", 1) != 0:
+            return None
+        values = [line.strip() for line in _out_text(cp).splitlines()
+                  if line.strip()]
+        return values or None
+
+    def read(self) -> bytes:
+        cp = self._run(self.read_argv, timeout=CLIP_READ_TIMEOUT)
+        if getattr(cp, "returncode", 1) != 0:
+            raise ClipboardError(
+                f"{self.name} 读取失败（退出码 {getattr(cp, 'returncode', '?')}）"
+                f"：{_clip_stderr(cp)}")
+        return _out_bytes(cp)
+
+    def write(self, data: bytes) -> None:
+        cp = self._run(self.write_argv, timeout=CLIP_WRITE_TIMEOUT,
+                       input_data=data)
+        if getattr(cp, "returncode", 1) != 0:
+            raise ClipboardError(
+                f"{self.name} 写入失败（退出码 {getattr(cp, 'returncode', '?')}）"
+                f"：{_clip_stderr(cp)}")
+
+
+def make_clipboard(session: str | None = None, *, which=None,
+                   runner=None) -> Clipboard | None:
+    """按会话选择剪贴板工具；一个都没有返回 None（调用方降级并提示）。"""
+    session = detect_session() if session is None else session
+    which = shutil.which if which is None else which
+
+    def xclip():
+        return CommandClipboard(
+            "xclip",
+            read_argv=["xclip", "-selection", "clipboard", "-o"],
+            write_argv=["xclip", "-selection", "clipboard", "-i"],
+            targets_argv=["xclip", "-selection", "clipboard", "-o",
+                          "-t", "TARGETS"],
+            runner=runner)
+
+    def xsel():
+        return CommandClipboard(
+            "xsel",
+            read_argv=["xsel", "--clipboard", "--output"],
+            write_argv=["xsel", "--clipboard", "--input"],
+            runner=runner)
+
+    if session == "wayland" and which("wl-copy") and which("wl-paste"):
+        return CommandClipboard(
+            "wl-copy",
+            read_argv=["wl-paste", "--no-newline"],
+            write_argv=["wl-copy"],
+            targets_argv=["wl-paste", "--list-types"],
+            runner=runner)
+    if which("xclip"):
+        return xclip()
+    if which("xsel"):
+        return xsel()
+    return None
+
+
+def is_text_targets(targets: list[str] | None) -> bool:
+    if targets is None:
+        return True                    # xsel 不支持列 targets：只能读了再看
+    for target in targets:
+        low = target.strip().lower()
+        if low in TEXT_TARGETS or low.startswith("text/plain"):
+            return True
+    return False
+
+
+def default_paste_wait(nbytes: int) -> float:
+    """目标应用异步取走剪贴板内容所需的时间（按体积估算）。"""
+    if nbytes <= 200_000:
+        return 0.5
+    return min(3.0, 0.5 + nbytes / 1_000_000)
+
+
+def paste_key_for(info: dict | None, override: str | None = None) -> str:
+    if override:
+        return override
+    if is_terminal(info):
+        cls = (info.get("class") or info.get("name") or "").lower()
+        return "shift+insert" if cls in PASTE_SHIFT_INSERT else "ctrl+shift+v"
+    return "ctrl+v"
+
+
+def paste_text(typer: "Typer", text: str, *, clip: Clipboard,
+               paste_key: str = "ctrl+v", restore: bool = True,
+               wait: float | None = None, sleep=time.sleep) -> None:
+    """把文本放进剪贴板并按粘贴键；备份失败时 fail-closed。
+
+    备份失败/非文本/超 4 MiB → ``ClipboardUnsafe``（退出码 2），
+    除非调用方显式 ``restore=False``（--no-clipboard-backup）。
+    """
+    data = text.encode("utf-8")
+    backup = None
+    if restore:
+        if not is_text_targets(clip.targets()):
+            raise ClipboardUnsafe(
+                "剪贴板当前内容不是文本（可能是图片），无法安全备份。\n"
+                "为避免覆盖你的剪贴板，已停止。确认可以覆盖时加 "
+                "--no-clipboard-backup。")
+        try:
+            backup = clip.read()
+        except ClipboardError as e:
+            raise ClipboardUnsafe(
+                f"无法备份当前剪贴板（{e}）。\n"
+                f"为避免覆盖你的剪贴板，已停止。确认可以覆盖时加 "
+                f"--no-clipboard-backup。")
+        if len(backup) > MAX_CLIP_BACKUP:
+            raise ClipboardUnsafe(
+                f"剪贴板内容超过 {MAX_CLIP_BACKUP} 字节，无法安全备份。\n"
+                f"确认可以覆盖时加 --no-clipboard-backup。")
+    if wait is None:
+        wait = default_paste_wait(len(data))
+    try:
+        clip.write(data)
+        sleep(CLIP_SETTLE)
+        typer.press(paste_key)
+        sleep(wait)
+    finally:
+        if backup is not None:
+            try:
+                clip.write(backup)
+            except Exception as e:
+                sys.stderr.write(f"⚠ 剪贴板恢复失败，原内容已丢失：{e}\n")
+
+
+def send_text(typer: "Typer", text: str, *, args, target_info: dict | None,
+              clip_factory=None) -> bool:
+    """paste-mode 的唯一实现：返回 True 表示已走剪贴板，False 表示降级逐字符。"""
+    clip_factory = make_clipboard if clip_factory is None else clip_factory
+    clip = clip_factory()
+    if clip is None:
+        sys.stderr.write(
+            "⚠  未找到 xclip/xsel/wl-copy，--paste-mode 降级为逐字符输入。"
+            "安装：sudo apt install xclip（或 wl-clipboard）\n")
+        est = len(text) * max(args.delay, 0.0)
+        if est >= 5:
+            sys.stderr.write(f"   预计耗时约 {est:.0f} 秒（Ctrl-C 可中断）\n")
+        typer.type_text(text)
+        return False
+    info = target_info
+    if info is None:
+        try:
+            info = typer.focus_info()
+        except Exception:
+            info = None
+    key = paste_key_for(info, args.paste_key)
+    try:
+        paste_text(typer, text, clip=clip, paste_key=key,
+                   restore=not args.no_clipboard_backup,
+                   wait=args.paste_wait)
+    except ClipboardError as e:
+        sys.stderr.write(
+            f"⚠  剪贴板操作失败（{e}），降级为逐字符输入。\n")
+        typer.type_text(text)
+        return False
+    return True
+
+
 # ------------------------------------------------------------- 会话层外观
 class Typer:
     """对外统一入口：选择后端并把所有调用转发过去。"""
@@ -2124,6 +2367,15 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                     help="列出可定向的窗口（TSV）后退出；可与 --window 过滤合用")
     ap.add_argument("--json", action="store_true",
                     help="配合 --list-windows 输出 JSON")
+    ap.add_argument("--paste-mode", action="store_true",
+                    help="把内容写入剪贴板并发送一次粘贴键（大段文本首选）")
+    ap.add_argument("--paste-key", metavar="COMBO",
+                    help="覆盖粘贴快捷键，如 ctrl+v / ctrl+shift+v / shift+insert")
+    ap.add_argument("--paste-wait", type=float, default=None, metavar="秒",
+                    help="发送粘贴键后等目标取走内容的秒数（默认按体积，0-10）")
+    ap.add_argument("--no-clipboard-backup", "--no-restore-clipboard",
+                    dest="no_clipboard_backup", action="store_true",
+                    help="不备份/不恢复原剪贴板（默认 fail-closed：备份失败即停止）")
     ap.add_argument("--allow-root", action="store_true",
                     help="允许以 root 运行（不推荐）")
     ap.add_argument("-V", "--version", action="version",
@@ -2300,6 +2552,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if interactive:
+            if args.paste_mode:
+                sys.stderr.write(
+                    "--paste-mode 目前只支持命令行模式（REPL 内请用 :k 或直接粘贴）。\n")
+                return 1
             cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
                            delay=delay, window=args.window)
             typer = Typer(backend=args.backend, delay=cfg.delay)
@@ -2321,16 +2577,37 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_newline:
             payload = payload.rstrip("\n")
 
+        user_keys = list(args.key)
         if payload:
             args.key.insert(0, payload)
         if not args.key:
             ap.print_help()
             return 1
 
+        # ---- paste-mode 的参数契约（在任何注入/剪贴板操作之前）
+        if args.paste_key and not args.paste_mode:
+            raise Abort("--paste-key 只能在 --paste-mode 下使用。")
+        if args.paste_mode:
+            if user_keys:
+                raise Abort("--paste-mode 不能与 -k 组合键混用。")
+            if len(args.key) != 1:
+                raise Abort("--paste-mode 只支持单个文本 payload。")
+            if args.paste_key:
+                if not is_combo(args.paste_key):
+                    raise Abort(
+                        f"--paste-key 需要组合键（如 ctrl+v）：{args.paste_key!r}")
+                parse_combo(args.paste_key)        # 校验修饰键名
+            if args.paste_wait is not None:
+                _num(str(args.paste_wait), 0.0, MAX_PASTE_WAIT, "paste-wait")
+        joined = "".join(args.key)
+
         for item in args.key:
             validate_payload(item, args.allow_control)
 
         typer = Typer(backend=args.backend, delay=delay)
+        if args.paste_mode and not typer.capabilities().get("combos"):
+            raise BackendUnavailable(
+                f"当前后端 {args.backend} 不支持组合键，无法使用 --paste-mode。")
 
         # ---- --window：先解析目标（只读），激活留到确认之后
         target = None
@@ -2369,11 +2646,21 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 sys.stdout.write(
                     "（该后端自带键盘映射，跳过字符可映射性检查）\n")
+            if args.paste_mode:
+                info = target_info
+                if info is None:
+                    try:
+                        info = typer.focus_info()
+                    except Exception:
+                        info = None
+                key = paste_key_for(info, args.paste_key)
+                sys.stdout.write(
+                    f"粘贴模式 : 将把 {len(joined)} 字符写入剪贴板并发送 "
+                    f"{key}（dry-run 未执行）\n")
             sys.stdout.write("dry-run：未发送任何按键。\n")
             return 0
 
         # ---- 安全闸门 2: 终端里的多行文本（Wayland 下所有多行都要确认）
-        joined = "".join(args.key)
         if target_info is not None:
             risk = multiline_risk(typer, joined, info=target_info)
         else:
@@ -2403,6 +2690,15 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(
                 "焦点已离开定向窗口，已取消（避免敲到别处）。\n")
             return 3
+
+        # ---- paste-mode：唯一一次剪贴板写入发生在倒计时与焦点复核之后
+        if args.paste_mode:
+            if args.no_clipboard_backup:
+                sys.stderr.write(
+                    "⚠  --no-clipboard-backup：不备份/不恢复剪贴板，"
+                    "原内容会被覆盖。\n")
+            send_text(typer, joined, args=args, target_info=target_info)
+            return 0
 
         for item in args.key:
             if len(item) == 1 or not is_combo(item):
