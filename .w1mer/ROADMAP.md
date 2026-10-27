@@ -45,7 +45,7 @@
 | # | Task | Doc | Status | Defer | Effect |
 |---|------|-----|--------|-------|--------|
 <!-- w1mer:task:infra -->
-| 01 | 工程化基线：pyproject 打包 + unittest 测试套件 + CI | 让项目可 pip/pipx 安装（console_scripts=autopaste），把版本号收敛到单一来源；新增 tests/ 用假后端覆盖 payload 校验、参数解析、REPL 行编辑、键盘映射还原，要求整套测试无需 DISPLAY 即可跑；CI 增加测试 job。 | done | 0 | 2026-10-27 · pipx/pip 可安装（版本唯一来源 autopaste.__version__）；62 个 unittest 无 DISPLAY 全绿；CI 增 tests/package job |
+| 01 | 工程化基线：pyproject 打包 + unittest 测试套件 + CI | 让项目可 pip/pipx 安装（console_scripts=autopaste），把版本号收敛到单一来源；新增 tests/ 用假后端覆盖 payload 校验、参数解析、REPL 行编辑、键盘映射还原，要求整套测试无需 DISPLAY 即可跑；CI 增加测试 job。 | done | 0 | 2026-10-27 716ddca · pipx/pip 可安装（版本唯一来源 autopaste.__version__）；62 个 unittest 无 DISPLAY 全绿；CI 增 tests/package job |
 
 
 ## 五、Backlog
