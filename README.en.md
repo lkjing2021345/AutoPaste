@@ -28,7 +28,7 @@ git clone git@github.com:lkjing2021345/AutoPaste.git
 cd AutoPaste && ./install.sh     # symlink to ~/.local/bin/autopaste
 ```
 
-Requirements: Linux, Python ≥ 3.8. X11 works out of the box; Wayland needs `wtype` (recommended; wlroots/KWin) or `ydotool` (GNOME; requires `ydotoold` and `/dev/uinput` access). On GNOME, `auto` prefers `ydotool` (mutter lacks the virtual-keyboard protocol wtype needs); other desktops prefer `wtype`.
+Requirements: Linux, Python ≥ 3.8 (CI runs the full suite on 3.8, 3.9 and 3.13). X11 works out of the box; Wayland needs `wtype` (recommended; wlroots/KWin) or `ydotool` (GNOME; requires `ydotoold` and `/dev/uinput` access). On GNOME, `auto` prefers `ydotool` (mutter lacks the virtual-keyboard protocol wtype needs); other desktops prefer `wtype`.
 
 ## CLI
 

@@ -32,11 +32,16 @@ jobs:
         run: test -n "$(ls tests/test_*.py)"
 
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.9", "3.13"]
+        include:
+          # 3.8 没有 noble 预编译构建，单独用 jammy 覆盖声明的最低版本
+          - os: ubuntu-22.04
+            python-version: "3.8"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

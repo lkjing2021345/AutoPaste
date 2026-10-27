@@ -150,6 +150,9 @@ python3 autopaste.py --version
 打包用 `pyproject.toml`（PEP 621），版本号唯一来源是 `autopaste.py` 里的
 `__version__`：`pipx install .` 或 `pip install .` 即可安装。
 
+CI 覆盖声明的最低版本：Python 3.8（ubuntu-22.04）与 3.9/3.13 都会跑完整单元测试，
+`check` job 另覆盖 3.9–3.13。
+
 ## 许可证
 
 [MIT](LICENSE) © 2026 lkjing2021345
