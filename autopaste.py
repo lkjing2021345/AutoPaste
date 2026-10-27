@@ -2197,9 +2197,16 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True,
             sys.stdout.flush()
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
             if r and cancelable:
-                os.read(sys.stdin.fileno(), 1024)
-                sys.stdout.write("\r" + " " * 70 + "\r  已取消\r\n")
-                return False
+                try:
+                    data = os.read(sys.stdin.fileno(), 1024)
+                except OSError:
+                    data = b""
+                if data:
+                    sys.stdout.write("\r" + " " * 70 + "\r  已取消\r\n")
+                    return False
+                # EOF（如 `cat note.txt | autopaste -s 3 -`）：stdin 再也
+                # 变不出按键，停止监听，但倒计时必须照常走完。
+                cancelable = False
     except KeyboardInterrupt:
         sys.stdout.write("\r" + " " * 70 + "\r  已取消\r\n")
         return False

@@ -116,5 +116,37 @@ class ReplFocusTests(unittest.TestCase):
         self.assertEqual(typer.typed, ["hi"])
 
 
+
+class CountdownEofTests(unittest.TestCase):
+    def _eof_stdin(self):
+        rfd, wfd = os.pipe()
+        os.close(wfd)                       # 立刻 EOF
+        raw = os.fdopen(rfd, "r")
+        self.addCleanup(raw.close)
+        return raw
+
+    def test_eof_does_not_cancel_countdown(self):
+        raw = self._eof_stdin()
+        typer = ReplTyper()
+        with mock.patch.object(autopaste.sys, "stdin", raw), \
+                redirect_std() as (out, _):
+            ok = autopaste.countdown(0.15, typer, cancelable=True)
+        self.assertTrue(ok)
+        self.assertNotIn("已取消", out.getvalue())
+
+    def test_keypress_still_cancels_countdown(self):
+        rfd, wfd = os.pipe()
+        os.write(wfd, b"x")
+        os.close(wfd)
+        raw = os.fdopen(rfd, "r")
+        self.addCleanup(raw.close)
+        typer = ReplTyper()
+        with mock.patch.object(autopaste.sys, "stdin", raw), \
+                redirect_std() as (out, _):
+            ok = autopaste.countdown(5.0, typer, cancelable=True)
+        self.assertFalse(ok)
+        self.assertIn("已取消", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
