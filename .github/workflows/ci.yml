@@ -25,9 +25,15 @@ jobs:
       - name: 校验文档中引用的文件都存在
         run: |
           for f in LICENSE README.md README.en.md SECURITY.md CHANGELOG.md \
-                   install.sh pyproject.toml; do
+                   CONTRIBUTING.md MANIFEST.in install.sh pyproject.toml \
+                   docs/README.md docs/usage.md docs/cli.md \
+                   docs/backends.md docs/design.md tools/gen_cli_docs.py; do
             test -f "$f" || { echo "缺少 $f"; exit 1; }
           done
+      - name: 文档与代码一致
+        run: |
+          python tools/gen_cli_docs.py --check
+          python -m unittest discover -s tests -p "test_docs.py" -v
       - name: 校验 tests/ 存在测试
         run: test -n "$(ls tests/test_*.py)"
 
