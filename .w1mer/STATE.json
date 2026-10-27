@@ -1,27 +1,65 @@
 {
   "version": 1,
-  "updated": "2026-10-27T10:07:37Z",
-  "current": "01",
+  "updated": "2026-10-27T07:52:11Z",
+  "current": "02.1",
   "tasks": {
     "01": {
       "type": "main",
       "base": "8b22d3e6cd8a12adabf20b697fc90188b3ed3469",
-      "end": null,
+      "end": "9c6c9a373ac95353380aeb717ac7adc3d8062c6c",
       "roles": {
         "reviewer": {
-          "joined": false,
-          "at": null
+          "joined": true,
+          "at": "2026-10-27T07:26:27Z"
         },
         "implementer": {
           "joined": true,
           "at": "2026-10-27T10:07:37Z"
         },
         "explorer": {
-          "joined": false,
-          "at": null
+          "joined": true,
+          "at": "2026-10-27T07:26:27Z"
         }
       },
       "started": "2026-10-27T10:07:06Z",
+      "ended": "2026-10-27T12:04:52Z"
+    },
+    "02": {
+      "type": "main",
+      "base": "9c6c9a373ac95353380aeb717ac7adc3d8062c6c",
+      "end": "981c9bd3647c72ce14ff406cd3d24d702bab78a7",
+      "roles": {
+        "reviewer": {
+          "joined": true,
+          "at": "2026-10-27T07:41:59Z"
+        },
+        "implementer": {
+          "joined": true,
+          "at": "2026-10-27T07:26:59Z"
+        },
+        "explorer": {
+          "joined": true,
+          "at": "2026-10-27T07:45:23Z"
+        }
+      },
+      "started": "2026-10-27T07:26:27Z",
+      "ended": "2026-10-27T07:51:48Z"
+    },
+    "02.1": {
+      "type": "sub",
+      "base": "981c9bd3647c72ce14ff406cd3d24d702bab78a7",
+      "end": null,
+      "roles": {
+        "reviewer": {
+          "joined": false,
+          "at": null
+        },
+        "fixer": {
+          "joined": true,
+          "at": "2026-10-27T07:52:11Z"
+        }
+      },
+      "started": "2026-10-27T07:51:48Z",
       "ended": null
     }
   }

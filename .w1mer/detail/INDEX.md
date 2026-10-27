@@ -9,8 +9,10 @@
 | ID | Title | State | Doc |
 |----|-------|-------|-----|
 <!-- w1mer:rows -->
-| "01" | 01 实施记录 | active | [01_01_实施记录.md](01_01_实施记录.md) |
+| "01" | "02 实施记录" | active | [01_02_实施记录.md](01_02_实施记录.md) |
 | "02" | 后端抽象 + Wayland 支持（wtype/ydotool）— 实施计划 | active | [02_backend-abstraction.md](02_backend-abstraction.md) |
+| "03" | 03 目标窗口定向 + 输入提速 — 实施计划 | active | [01_03_窗口定向与提速方案.md](01_03_窗口定向与提速方案.md) |
+| "04" | 04 REPL 与诊断增强 — 实施计划 | active | [01_04_repl_与诊断增强方案.md](01_04_repl_与诊断增强方案.md) |
 <!-- /w1mer:rows -->
 
 ## Lifecycle
