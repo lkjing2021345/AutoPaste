@@ -271,6 +271,33 @@ class MainConfigTests(unittest.TestCase):
         self.assertIn("倒计时=1.5s（配置）", out)
         self.assertIn("字符间隔=0.02s（命令行）", out)
 
+    def test_repl_uses_config_auto_enter_and_sleep(self):
+        import test_repl
+        rfd, wfd = os.pipe()
+        os.write(wfd, b":t\n:q\n")
+        os.close(wfd)
+        raw = os.fdopen(rfd, "r")
+        self.addCleanup(raw.close)
+        with temp_home() as home:
+            write_config(home, "auto_enter = true\nsleep = 1.5\n")
+            typer_inst = test_repl.ReplTyper()
+            with mock.patch.object(autopaste, "Typer",
+                                   return_value=typer_inst), \
+                    mock.patch.object(os, "geteuid", return_value=1000,
+                                      create=True), \
+                    mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                    mock.patch.object(autopaste.sys, "stdin",
+                                      test_repl.FakeTTY(raw)), \
+                    mock.patch.object(autopaste.termios, "tcgetattr",
+                                      return_value=["old"]), \
+                    mock.patch.object(autopaste.termios, "tcsetattr"), \
+                    mock.patch.object(autopaste.tty, "setcbreak"), \
+                    redirect_std() as (out, _):
+                code = autopaste.main(["--repl"])
+        self.assertEqual(code, 0)
+        self.assertIn("自动回车=开", out.getvalue())
+        self.assertIn("倒计时=1.5s（配置）", out.getvalue())
+
     def test_config_symlink_rejected_by_main(self):
         code, _, err, _ = self._run(
             ["--dry-run", "hi"], config="delay = 0.01\n", symlink=True)

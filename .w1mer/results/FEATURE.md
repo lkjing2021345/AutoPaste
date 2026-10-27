@@ -32,7 +32,8 @@
 
 ## 04.4 配置与退出码（2026-10-27 / 739985f）
 
-- 配置：合法扁平 TOML 解析 5 个键；`allow_root`/`allow_control`/`yes`/
+- 配置：合法扁平 TOML 解析 5 个键（含 REPL 实际应用 `auto_enter=true` 与
+  `sleep=1.5`，`:t` 显示"配置"来源）；`allow_root`/`allow_control`/`yes`/
   `no_restore_clipboard` → 退出 2；`allow-root` → "非法键名" 退出 2；
   未知键警告后忽略；`nan/inf/数组/日期`、重复键、非 UTF-8 均报错并带
   `路径:行号`。
@@ -49,6 +50,6 @@
 
 ## 04 整体
 
-- 测试规模：241（基线）→ **329**，全绿（`env -u DISPLAY python3 -m unittest
+- 测试规模：241（基线）→ **330**，全绿（`env -u DISPLAY python3 -m unittest
   discover -s tests`，3.3s，无 tty/无 X 依赖）。
 - 结论：significant。

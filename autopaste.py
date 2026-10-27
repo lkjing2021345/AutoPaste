@@ -3469,7 +3469,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             cfg = Settings(
                 sleep=(DEFAULT_SLEEP_REPL if sleep is None else sleep),
-                delay=delay, window=args.window,
+                delay=delay, auto_enter=bool(R["auto_enter"][0]),
+                window=args.window,
                 delay_src=R["delay"][1], sleep_src=R["sleep"][1])
             history = None
             if not args.no_history:
