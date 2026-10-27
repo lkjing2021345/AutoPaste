@@ -33,14 +33,25 @@ class BuildParserTests(unittest.TestCase):
 
 
 class MainExitCodeTests(unittest.TestCase):
-    def _main(self, argv, env):
+    def _main(self, argv, env, mock_typer=True):
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(os, "geteuid", return_value=1000,
                                   create=True), \
-                mock.patch.object(autopaste, "Typer") as typer_cls, \
                 redirect_std() as (out, err):
-            typer_cls.return_value.resolvable.return_value = []
-            code = autopaste.main(argv)
+            if mock_typer:
+                with mock.patch.object(autopaste, "Typer") as typer_cls, \
+                        mock.patch.object(autopaste.shutil, "which",
+                                          return_value=None):
+                    typer_cls.return_value.resolvable.return_value = []
+                    typer_cls.return_value.capabilities.return_value = {
+                        "name": "x11", "can_focus_info": True,
+                        "can_paste_mode": False, "unicode": True,
+                        "needs_remap": True, "combos": True,
+                        "per_char_delay": True, "daemon": False}
+                    typer_cls.return_value.focus_info.return_value = None
+                    code = autopaste.main(argv)
+            else:
+                code = autopaste.main(argv)
         return code, out.getvalue(), err.getvalue()
 
     def test_delay_out_of_range(self):
@@ -49,10 +60,17 @@ class MainExitCodeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("字符间隔", err)
 
-    def test_missing_display(self):
-        code, _, err = self._main(["hi"], {"DISPLAY": ""})
+    def test_missing_backend_exits_2(self):
+        # 无 X11、无 Wayland 工具 -> 环境类拒绝，退出码 2 且给出安装提示
+        with mock.patch.dict(os.environ, clear=True), \
+                mock.patch.object(os, "geteuid", return_value=1000,
+                                  create=True), \
+                mock.patch.object(autopaste.shutil, "which",
+                                  return_value=None), \
+                redirect_std() as (_, err):
+            code = autopaste.main(["hi"])
         self.assertEqual(code, 2)
-        self.assertIn("DISPLAY", err)
+        self.assertIn("wtype", err.getvalue())
 
     def test_control_chars_rejected(self):
         code, _, err = self._main(["a\x01b"], {"DISPLAY": ":0"})
@@ -60,8 +78,7 @@ class MainExitCodeTests(unittest.TestCase):
         self.assertIn("控制字符", err)
 
     def test_dry_run_exits_zero(self):
-        with mock.patch.object(autopaste, "focused_window", return_value=None):
-            code, out, _ = self._main(["--dry-run", "hi"], {"DISPLAY": ":0"})
+        code, out, _ = self._main(["--dry-run", "hi"], {"DISPLAY": ":0"})
         self.assertEqual(code, 0)
         self.assertIn("dry-run", out)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""autopaste - 把文本"敲"进任意 X11 窗口（XTEST 键盘注入，零依赖）
+"""autopaste - 把文本"敲"进当前聚焦的窗口（多后端键盘注入，零依赖）
 
 设计目标: 粘贴一段文本到"当前聚焦的窗口"，适用于任何支持键盘输入的程序
 （浏览器、终端、IDE、聊天软件……），不需要 xdotool，不需要 root。
@@ -43,8 +43,10 @@ import ctypes
 import ctypes.util
 import os
 import select
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 import termios
 import time
@@ -68,8 +70,10 @@ TERMINAL_CLASSES = {
 }
 
 # ----------------------------------------------------------------- X11 绑定
-x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-xtst = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+# 惰性 dlopen：纯 Wayland 机器/没有 libXtst 的 CI 上，import 本模块与
+# --help/--version/--dry-run 都不得因为缺 X 库而失败。
+x11 = None
+xtst = None
 
 P = ctypes.POINTER
 
@@ -82,37 +86,61 @@ class XClassHint(ctypes.Structure):
                 ("res_class", P(ctypes.c_char))]
 
 
-x11.XOpenDisplay.restype = ctypes.c_void_p
-x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-x11.XFlush.argtypes = [ctypes.c_void_p]
-x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-x11.XFree.argtypes = [ctypes.c_void_p]
-x11.XStringToKeysym.restype = ctypes.c_ulong
-x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
-x11.XKeysymToKeycode.restype = ctypes.c_ubyte
-x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-x11.XDisplayKeycodes.argtypes = [ctypes.c_void_p, P(ctypes.c_int),
-                                 P(ctypes.c_int)]
-x11.XGetKeyboardMapping.restype = P(ctypes.c_ulong)
-x11.XGetKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
-                                    ctypes.c_int, P(ctypes.c_int)]
-x11.XChangeKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                       ctypes.c_int, P(ctypes.c_ulong),
-                                       ctypes.c_int]
-x11.XkbKeycodeToKeysym.restype = ctypes.c_ulong
-x11.XkbKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
-                                   ctypes.c_int, ctypes.c_int]
-x11.XGetInputFocus.argtypes = [ctypes.c_void_p, P(ctypes.c_ulong),
-                               P(ctypes.c_int)]
-x11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
-                           P(ctypes.c_char_p)]
-x11.XGetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
-                              P(XClassHint)]
+def _load_x11() -> None:
+    """按需加载 libX11/libXtst 并声明函数原型（幂等）。"""
+    global x11, xtst
+    if x11 is not None:
+        return
+    try:
+        libx11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        libxtst = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+    except OSError as e:
+        x11 = xtst = None
+        raise BackendUnavailable(
+            f"无法加载 X11 库（libX11/libXtst）：{e}\n"
+            f"纯 Wayland 会话请用 --backend wtype 或 --backend ydotool。")
 
-xtst.XTestFakeKeyEvent.restype = ctypes.c_int
-xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                   ctypes.c_int, ctypes.c_ulong]
+    libx11.XOpenDisplay.restype = ctypes.c_void_p
+    libx11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    libx11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    libx11.XFlush.argtypes = [ctypes.c_void_p]
+    libx11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libx11.XFree.argtypes = [ctypes.c_void_p]
+    libx11.XStringToKeysym.restype = ctypes.c_ulong
+    libx11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+    libx11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    libx11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    libx11.XDisplayKeycodes.argtypes = [ctypes.c_void_p, P(ctypes.c_int),
+                                        P(ctypes.c_int)]
+    libx11.XGetKeyboardMapping.restype = P(ctypes.c_ulong)
+    libx11.XGetKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
+                                           ctypes.c_int, P(ctypes.c_int)]
+    libx11.XChangeKeyboardMapping.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                              ctypes.c_int, P(ctypes.c_ulong),
+                                              ctypes.c_int]
+    libx11.XkbKeycodeToKeysym.restype = ctypes.c_ulong
+    libx11.XkbKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
+                                          ctypes.c_int, ctypes.c_int]
+    libx11.XGetInputFocus.argtypes = [ctypes.c_void_p, P(ctypes.c_ulong),
+                                      P(ctypes.c_int)]
+    libx11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                  P(ctypes.c_char_p)]
+    libx11.XGetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                     P(XClassHint)]
+
+    libxtst.XTestFakeKeyEvent.restype = ctypes.c_int
+    libxtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                          ctypes.c_int, ctypes.c_ulong]
+
+    x11, xtst = libx11, libxtst
+
+
+def _require_x11() -> None:
+    if x11 is None:
+        raise BackendUnavailable(
+            "X11 后端未初始化（当前进程没有加载 libX11）。"
+            "纯 Wayland 会话请用 --backend wtype 或 --backend ydotool。")
+
 
 NoSymbol = 0
 
@@ -138,6 +166,14 @@ class Abort(Exception):
     """用户取消 / 安全检查拦截"""
 
 
+class BackendError(Abort):
+    """键盘后端运行期失败（外部工具报错等）"""
+
+
+class BackendUnavailable(BackendError):
+    """环境缺失：没装工具、没有会话、权限不足、socket 不存在等"""
+
+
 def _char_keysym(ch: str) -> int:
     """单个字符 -> X11 keysym（Latin-1 直接用码点，其余用 Unicode keysym）"""
     cp = ord(ch)
@@ -152,6 +188,7 @@ def _decode(b) -> str | None:
 
 def focused_window(dpy) -> dict | None:
     """读取当前焦点窗口的标题/类名，用于让用户确认"会敲到哪里" """
+    _require_x11()
     try:
         win = ctypes.c_ulong()
         rev = ctypes.c_int()
@@ -225,13 +262,55 @@ def check_regular_file(path: str) -> None:
         raise Abort(f"文件过大（{st.st_size} 字节 > 上限 {MAX_PAYLOAD}）")
 
 
-# ------------------------------------------------------------------ 键盘注入
-class Typer:
+# ------------------------------------------------------------------ 后端抽象
+class Backend:
+    """键盘注入后端契约。
+
+    约定：
+    * ``close()`` 必须幂等且不抛异常；
+    * ``type_text`` / ``type_char`` / ``press`` 失败抛 ``BackendError``；
+    * ``focus_info()`` 拿不到焦点时返回 ``None``，不得阻塞超过 100ms；
+    * ``resolvable()`` 只供 dry-run 使用，不需要字符重映射的后端返回空列表。
+    """
+
+    name = "base"
+
+    def type_text(self, text: str) -> None:
+        raise NotImplementedError
+
+    def type_char(self, ch: str) -> None:
+        self.type_text(ch)
+
+    def press(self, combo: str) -> None:
+        raise NotImplementedError
+
+    def focus_info(self) -> dict | None:
+        return None
+
+    def capabilities(self) -> dict:
+        return {"name": self.name, "can_focus_info": False,
+                "can_paste_mode": False, "unicode": False,
+                "needs_remap": False, "combos": False,
+                "per_char_delay": False, "daemon": False}
+
+    def resolvable(self, text: str) -> list[str]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+class X11Backend(Backend):
+    """XTEST 键盘注入（原 Typer 实现，行为保持不变）。"""
+
+    name = "x11"
+
     def __init__(self, delay: float = 0.008, remap_wait: float = 0.02):
+        _load_x11()
         self.dpy = x11.XOpenDisplay(None)
         if not self.dpy:
-            raise Abort("无法连接 X 服务器（DISPLAY=%s）"
-                        % os.environ.get("DISPLAY", "(未设置)"))
+            raise BackendUnavailable("无法连接 X 服务器（DISPLAY=%s）"
+                                     % os.environ.get("DISPLAY", "(未设置)"))
         self.delay = delay
         self.remap_wait = remap_wait
         self.shift_kc = x11.XKeysymToKeycode(self.dpy, KEYSYM_SHIFT)
@@ -239,7 +318,6 @@ class Typer:
         self.spare_kc = self._find_spare_keycode()
         self._remapped = False
         self._closed = False
-        atexit.register(self.close)
 
     # ------------------------------------------------------------- 查询
     def _keysyms_per_keycode(self) -> int:
@@ -386,6 +464,16 @@ class Typer:
             x11.XFlush(self.dpy)
         time.sleep(self.delay)
 
+    # ------------------------------------------------------------- 元信息
+    def focus_info(self) -> dict | None:
+        return focused_window(self.dpy)
+
+    def capabilities(self) -> dict:
+        return {"name": self.name, "can_focus_info": True,
+                "can_paste_mode": False, "unicode": True,
+                "needs_remap": True, "combos": True,
+                "per_char_delay": True, "daemon": False}
+
     # ------------------------------------------------------------- 清理
     def close(self) -> None:
         if self._closed:
@@ -399,6 +487,150 @@ class Typer:
             x11.XCloseDisplay(self.dpy)
         except Exception:
             pass
+
+
+# ------------------------------------------------------------- 后端选择
+def detect_session(env=None) -> str:
+    """返回 "x11" / "wayland" / "unknown"。
+
+    XDG_SESSION_TYPE 优先于 DISPLAY：XWayland 下 DISPLAY 存在，但 XTEST
+    事件到不了原生 Wayland 窗口，不能据此认定是 X11 会话。
+    """
+    env = os.environ if env is None else env
+    st = (env.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if st == "wayland":
+        return "wayland"
+    if st == "x11":
+        return "x11"
+    if env.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if env.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+
+def _missing_hint(session: str) -> str:
+    return (
+        f"没有可用的键盘注入后端（会话类型：{session}）。\n"
+        f"Wayland 需要 wtype 或 ydotool 之一，当前都没找到。\n\n"
+        f"  Arch          : sudo pacman -S wtype ydotool\n"
+        f"  Debian/Ubuntu : sudo apt install wtype ydotool\n"
+        f"  Fedora        : sudo dnf install wtype ydotool\n\n"
+        f"推荐先装 wtype（无需守护进程、无需额外权限）。\n"
+        f"GNOME（mutter 不支持 virtual-keyboard 协议）请装 ydotool，然后：\n"
+        f"  systemctl --user enable --now ydotoold\n"
+        f"  sudo usermod -aG input $USER   # 或给 /dev/uinput 写 0660 udev 规则\n"
+        f"（本程序拒绝以 root 运行，权限必须授予你自己的用户。）")
+
+
+def choose_backend(requested: str = "auto", env=None, which=None) -> str:
+    """把 --backend 的取值解析成具体后端名；auto 只在本版本支持的范围内选择。"""
+    env = os.environ if env is None else env
+    which = shutil.which if which is None else which
+    if requested != "auto":
+        return requested
+    if detect_session(env) == "x11":
+        return "x11"
+    raise BackendUnavailable(_missing_hint(detect_session(env)))
+
+
+def make_backend(name: str = "auto", *, delay: float = 0.008,
+                 remap_wait: float = 0.02, which=None, env=None,
+                 runner=None) -> Backend:
+    resolved = choose_backend(name, env=env, which=which)
+    if resolved == "x11":
+        return X11Backend(delay=delay, remap_wait=remap_wait)
+    raise BackendUnavailable(f"未知后端: {resolved}")
+
+
+# ------------------------------------------------------------- 会话层外观
+class Typer:
+    """对外统一入口：选择后端并把所有调用转发过去。"""
+
+    def __init__(self, backend: str = "auto", delay: float = 0.008,
+                 remap_wait: float = 0.02, *, which=None, env=None,
+                 runner=None):
+        self.backend = make_backend(backend, delay=delay,
+                                    remap_wait=remap_wait, which=which,
+                                    env=env, runner=runner)
+        self._delay = delay
+        self._closed = False
+        atexit.register(self.close)
+
+    @property
+    def delay(self) -> float:
+        return self._delay
+
+    @delay.setter
+    def delay(self, value: float) -> None:
+        self._delay = value
+        self.backend.delay = value
+
+    def type_text(self, text: str) -> None:
+        return self.backend.type_text(text)
+
+    def type_char(self, ch: str) -> None:
+        return self.backend.type_char(ch)
+
+    def press(self, combo: str) -> None:
+        return self.backend.press(combo)
+
+    def focus_info(self) -> dict | None:
+        return self.backend.focus_info()
+
+    def capabilities(self) -> dict:
+        return self.backend.capabilities()
+
+    def resolvable(self, text: str) -> list[str]:
+        return self.backend.resolvable(text)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.backend.close()
+        except Exception:
+            pass
+
+
+def target_label(typer: Typer) -> str:
+    """倒计时/提示里"会敲到哪里"的一句话。"""
+    caps = typer.capabilities()
+    if not caps.get("can_focus_info"):
+        return f"Wayland 会话（{caps.get('name')}：看不到焦点窗口，请自己确认）"
+    try:
+        return describe_window(typer.focus_info())
+    except Exception:
+        return "未知窗口"
+
+
+def multiline_risk(typer: Typer, text: str) -> str | None:
+    """多行文本打进终端（或目标不可知）时的风险说明；无风险返回 None。"""
+    body = text.rstrip("\n")
+    if "\n" not in body:
+        return None
+    caps = typer.capabilities()
+    if not caps.get("can_focus_info"):
+        return "无法读取焦点窗口（Wayland）：多行文本若打进终端会被逐行执行。"
+    info = typer.focus_info()
+    if is_terminal(info):
+        n = len([line for line in body.splitlines() if line.strip()])
+        return (f"目标是终端 {describe_window(info)}：多行文本会被逐行执行"
+                f"（共 {n} 行）。")
+    return None
+
+
+def parse_combo(name: str) -> tuple[list[str], str]:
+    """解析 "ctrl+alt+t" -> (["ctrl","alt"], "t")。"""
+    tokens = name.split("+")
+    mods = []
+    for tok in tokens[:-1]:
+        tok = tok.lower().strip()
+        if tok not in MODIFIERS:
+            raise Abort(f"未知修饰键: {tok}")
+        mods.append(tok)
+    return mods, tokens[-1].strip()
 
 
 # ------------------------------------------------------------------ 行编辑器
@@ -565,7 +797,7 @@ class Settings:
 def countdown(seconds: float, typer: Typer, cancelable: bool = True) -> bool:
     """倒计时，顺手显示"会敲到哪个窗口"。返回 False 表示被取消。"""
     try:
-        target = describe_window(focused_window(typer.dpy))
+        target = target_label(typer)
     except Exception:
         target = "未知窗口"
     if seconds <= 0:
@@ -591,13 +823,10 @@ def countdown(seconds: float, typer: Typer, cancelable: bool = True) -> bool:
     return True
 
 
-def warn_terminal_target(typer: Typer, text: str) -> None:
-    info = focused_window(typer.dpy)
-    if is_terminal(info) and "\n" in text.rstrip("\n"):
-        lines = len([l for l in text.splitlines() if l.strip()])
-        sys.stderr.write(
-            f"⚠  目标是终端 {describe_window(info)}：多行文本会被逐行执行"
-            f"（共 {lines} 行）。确认内容安全后继续。\n")
+def warn_multiline_target(typer: Typer, text: str) -> None:
+    msg = multiline_risk(typer, text)
+    if msg:
+        sys.stderr.write(f"⚠  {msg}\n")
 
 
 BANNER = """\
@@ -642,7 +871,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
         sys.stdout.flush()
         while True:
             try:
-                target = describe_window(focused_window(typer.dpy))
+                target = target_label(typer)
             except Exception:
                 target = "?"
             short = target if len(target) <= 28 else target[:27] + "…"
@@ -669,7 +898,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
                         sys.stdout.write(
                             f"  倒计时={cfg.sleep}s  字符间隔={cfg.delay}s  "
                             f"自动回车={'开' if cfg.auto_enter else '关'}\n"
-                            f"  当前目标={describe_window(focused_window(typer.dpy))}\n")
+                            f"  当前目标={target_label(typer)}\n")
                     elif name == "s":
                         cfg.sleep = _num(arg, 0.0, MAX_COUNTDOWN, "倒计时")
                     elif name == "d":
@@ -689,7 +918,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
                                   errors="replace") as f:
                             body = f.read()
                         validate_payload(body)
-                        warn_terminal_target(typer, body)
+                        warn_multiline_target(typer, body)
                         if countdown(cfg.sleep, typer):
                             typer.type_text(body)
                         last = body
@@ -713,7 +942,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
                 sys.stdout.write(f"  已拦截: {e}\n")
                 continue
             last = text
-            warn_terminal_target(typer, text)
+            warn_multiline_target(typer, text)
             if countdown(cfg.sleep, typer):
                 typer.type_text(text)
                 if cfg.auto_enter:
@@ -778,6 +1007,10 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                     help="跳过确认提示（终端目标 + 多行文本时使用）")
     ap.add_argument("--allow-control", action="store_true",
                     help="允许输入控制字符（ESC 等），确认安全后再用")
+    ap.add_argument("--backend", choices=("auto", "x11"), default="auto",
+                    help="键盘注入后端：auto|x11（Wayland 后端见后续版本），默认 auto")
+    ap.add_argument("--list-backends", action="store_true",
+                    help="列出各后端可用性与探测依据后退出")
     ap.add_argument("--allow-root", action="store_true",
                     help="允许以 root 运行（不推荐）")
     ap.add_argument("-V", "--version", action="version",
@@ -814,9 +1047,35 @@ def _confirm(question: str) -> bool:
     return ans in ("y", "yes")
 
 
+def format_backends(env=None) -> str:
+    """`--list-backends` 的诊断输出：可用性 + 探测依据。"""
+    env = os.environ if env is None else env
+    session = detect_session(env)
+    try:
+        _load_x11()
+        x11_ok, x11_why = True, (f"DISPLAY={env.get('DISPLAY') or '(未设置)'}，"
+                                 "libX11/libXtst 可加载")
+    except Exception as e:
+        x11_ok, x11_why = False, str(e).splitlines()[0]
+    lines = [
+        "后端      可用  探测依据",
+        f"x11       {'是' if x11_ok else '否'}    {x11_why}",
+        f"当前会话: {session}",
+    ]
+    try:
+        lines.append(f"auto 将选择: {choose_backend('auto', env=env)}")
+    except BackendUnavailable:
+        lines.append("auto 将选择: （无可用后端）")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+
+    if args.list_backends:
+        sys.stdout.write(format_backends())
+        return 0
 
     # ---- 安全闸门 1: 不以 root 身份注入按键
     if hasattr(os, "geteuid") and os.geteuid() == 0 and not args.allow_root:
@@ -824,11 +1083,6 @@ def main(argv: list[str] | None = None) -> int:
             "拒绝以 root 运行：按键注入等同于代替你敲键盘，"
             "以 root 执行会把任何窗口都暴露给它。\n"
             "如确有需要，请显式加 --allow-root。\n")
-        return 2
-
-    if not os.environ.get("DISPLAY"):
-        sys.stderr.write("未设置 DISPLAY，autopaste 只支持 X11 会话"
-                         "（Wayland 可考虑 ydotool）。\n")
         return 2
 
     try:
@@ -846,7 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
         if interactive:
             cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
                            delay=delay)
-            typer = Typer(delay=cfg.delay)
+            typer = Typer(backend=args.backend, delay=cfg.delay)
             return repl(typer, cfg)
 
         # ---- 组装输入
@@ -874,12 +1128,13 @@ def main(argv: list[str] | None = None) -> int:
         for item in args.key:
             validate_payload(item, args.allow_control)
 
-        typer = Typer(delay=delay)
+        typer = Typer(backend=args.backend, delay=delay)
 
         # ---- dry-run：只预览
         if args.dry_run:
-            target = describe_window(focused_window(typer.dpy))
-            sys.stdout.write(f"目标窗口 : {target}\n")
+            caps = typer.capabilities()
+            sys.stdout.write(f"后端     : {caps.get('name')}\n")
+            sys.stdout.write(f"目标窗口 : {target_label(typer)}\n")
             total = sum(len(k) for k in args.key)
             sys.stdout.write(f"字符数   : {total}\n")
             for i, item in enumerate(args.key, 1):
@@ -890,20 +1145,22 @@ def main(argv: list[str] | None = None) -> int:
                 lines = item.count("\n")
                 sys.stdout.write(f"  [{i}] {kind} {lines + 1} 行: "
                                  f"{_esc_preview(item)}\n")
-            missing = typer.resolvable("".join(args.key))
-            if missing:
-                sys.stdout.write(f"无法映射的字符: {''.join(missing)!r}\n")
+            if caps.get("needs_remap"):
+                missing = typer.resolvable("".join(args.key))
+                if missing:
+                    sys.stdout.write(
+                        f"无法映射的字符: {''.join(missing)!r}\n")
+            else:
+                sys.stdout.write(
+                    "（该后端自带键盘映射，跳过字符可映射性检查）\n")
             sys.stdout.write("dry-run：未发送任何按键。\n")
             return 0
 
-        # ---- 安全闸门 2: 终端里的多行文本
+        # ---- 安全闸门 2: 终端里的多行文本（Wayland 下所有多行都要确认）
         joined = "".join(args.key)
-        info = focused_window(typer.dpy)
-        if is_terminal(info) and "\n" in joined.rstrip("\n"):
-            sys.stderr.write(
-                f"⚠  目标是终端 {describe_window(info)}：即将逐行输入 "
-                f"{len([l for l in joined.splitlines() if l.strip()])} 行内容，"
-                f"多行文本会被逐行执行。\n")
+        risk = multiline_risk(typer, joined)
+        if risk:
+            sys.stderr.write(f"⚠  {risk}\n")
             if not args.yes and not _confirm("继续？"):
                 sys.stderr.write("已取消。\n")
                 return 3
@@ -920,6 +1177,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 typer.press(item)
         return 0
+    except BackendUnavailable as e:
+        sys.stderr.write(f"{e}\n")
+        return 2
+    except BackendError as e:
+        sys.stderr.write(f"已拦截: {e}\n")
+        return 1
     except Abort as e:
         sys.stderr.write(f"已拦截: {e}\n")
         return 1

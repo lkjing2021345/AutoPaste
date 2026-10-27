@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Typer：按键顺序、Shift 释放、Unicode 重映射还原（假 X11/XTest）。"""
+"""X11Backend：按键顺序、Shift 释放、Unicode 重映射还原（假 X11/XTest）。"""
 
 import unittest
 from unittest import mock
@@ -34,7 +34,7 @@ class TyperTestBase(unittest.TestCase):
         for p in self._patches:
             p.start()
             self.addCleanup(p.stop)
-        self.typer = autopaste.Typer(delay=0.0, remap_wait=0.0)
+        self.typer = autopaste.X11Backend(delay=0.0, remap_wait=0.0)
         self.addCleanup(self.typer.close)
 
 
@@ -86,7 +86,7 @@ class TypeCharTests(TyperTestBase):
     def test_unicode_aborts_without_spare_keycode(self):
         for kc in range(self.x11.lo, self.x11.hi + 1):
             self.x11.keycode_to_keysym[(kc, 0, 0)] = 0x100
-        typer = autopaste.Typer(delay=0.0, remap_wait=0.0)
+        typer = autopaste.X11Backend(delay=0.0, remap_wait=0.0)
         self.addCleanup(typer.close)
         self.assertIsNone(typer.spare_kc)
         with self.assertRaises(autopaste.Abort):
@@ -132,7 +132,7 @@ class LifecycleTests(TyperTestBase):
     def test_open_display_failure(self):
         self.x11.dpy = 0
         with self.assertRaises(autopaste.Abort):
-            autopaste.Typer()
+            autopaste.X11Backend()
 
     def test_close_is_idempotent(self):
         self.typer.close()
