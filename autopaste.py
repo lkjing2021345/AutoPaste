@@ -2241,11 +2241,15 @@ def repl(typer: Typer, cfg: Settings) -> int:
     old = termios.tcgetattr(fd)
     ed = LineEditor(fd)
     last: str | None = None
+    #: 本轮提交实际激活的目标窗口（None = 不定向，敲当前焦点）
+    focus_target: WindowInfo | None = None
     sys.stdout.write(BANNER)
     sys.stdout.flush()
 
     def activate() -> bool:
         """REPL 里 --window 是粘性目标：每次提交前重新解析并激活。"""
+        nonlocal focus_target
+        focus_target = None
         if not cfg.window:
             return True
         try:
@@ -2253,10 +2257,30 @@ def repl(typer: Typer, cfg: Settings) -> int:
             if not typer.activate_window(target):
                 raise WindowUnavailable(
                     f"无法激活 {describe_window_info(target)}")
+            focus_target = target
             return True
         except Abort as e:
             sys.stdout.write(f"  已拦截: {e}\n")
             return False
+
+    def focus_ok() -> bool:
+        """倒计时后的焦点复核：焦点离开就跳过本次注入（与 CLI 一致）。
+
+        绝不"盲打"到当前窗口；REPL 不退出，用户可以直接重试。
+        """
+        if focus_target is None:
+            return True
+        try:
+            ok = typer.is_window_focused(focus_target.xid)
+        except Exception:
+            ok = False
+        if not ok:
+            sys.stderr.write(
+                f"  已拦截: 焦点已离开定向窗口 "
+                f"{describe_window_info(focus_target)}，已取消本次输入"
+                f"（避免敲到别处）。\n")
+            sys.stderr.flush()
+        return ok
 
     def cleanup():
         try:
@@ -2317,7 +2341,8 @@ def repl(typer: Typer, cfg: Settings) -> int:
                                          % ("开" if cfg.auto_enter else "关"))
                     elif name == "k":
                         validate_payload(arg)
-                        if activate() and countdown(cfg.sleep, typer):
+                        if (activate() and countdown(cfg.sleep, typer)
+                                and focus_ok()):
                             typer.press(arg)
                     elif name == "f":
                         check_regular_file(arg)
@@ -2326,13 +2351,15 @@ def repl(typer: Typer, cfg: Settings) -> int:
                             body = f.read()
                         validate_payload(body)
                         warn_multiline_target(typer, body)
-                        if activate() and countdown(cfg.sleep, typer):
+                        if (activate() and countdown(cfg.sleep, typer)
+                                and focus_ok()):
                             typer.type_text(body)
                         last = body
                     elif name == "r":
                         if last is None:
                             sys.stdout.write("  还没有可重复的内容\n")
-                        elif activate() and countdown(cfg.sleep, typer):
+                        elif (activate() and countdown(cfg.sleep, typer)
+                              and focus_ok()):
                             typer.type_text(last)
                     elif name == "":
                         pass
@@ -2350,7 +2377,8 @@ def repl(typer: Typer, cfg: Settings) -> int:
                 continue
             last = text
             warn_multiline_target(typer, text)
-            if activate() and countdown(cfg.sleep, typer):
+            if (activate() and countdown(cfg.sleep, typer)
+                    and focus_ok()):
                 typer.type_text(text)
                 if cfg.auto_enter:
                     typer.press("enter")
