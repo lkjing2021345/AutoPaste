@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autopaste"
+description = "把文本敲进当前聚焦的 X11 窗口（XTEST 键盘注入，零依赖）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "lkjing2021345" },
+]
+keywords = ["x11", "xtest", "keyboard", "automation", "paste", "xdotool"]
+# 版本号的唯一来源是 autopaste.py 里的 __version__，见 [tool.setuptools.dynamic]
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/lkjing2021345/AutoPaste"
+Source = "https://github.com/lkjing2021345/AutoPaste"
+
+[project.scripts]
+autopaste = "autopaste:main"
+
+[tool.setuptools]
+py-modules = ["autopaste"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autopaste.__version__" }

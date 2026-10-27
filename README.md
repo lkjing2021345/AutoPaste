@@ -26,6 +26,8 @@ autopaste                      # 交互 REPL：粘贴多行文本，零转义
 ```bash
 git clone git@github.com:lkjing2021345/AutoPaste.git
 cd AutoPaste
+pipx install .               # 推荐：装进独立环境，直接得到 autopaste 命令
+# 或者
 ./install.sh                 # 软链到 ~/.local/bin/autopaste
 ```
 
@@ -127,8 +129,16 @@ autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任�
 
 ```bash
 python3 -m py_compile autopaste.py
+python3 -m unittest discover -s tests -v   # 单元测试，不需要 DISPLAY
+python3 autopaste.py --version
 ./autopaste.py --dry-run -- "test 测试 123"
 ```
+
+测试只用标准库 `unittest`，通过替换模块级 `autopaste.x11` / `autopaste.xtst`
+为假后端来覆盖校验、行编辑与键盘注入逻辑，不会真的发送按键。
+
+打包用 `pyproject.toml`（PEP 621），版本号唯一来源是 `autopaste.py` 里的
+`__version__`：`pipx install .` 或 `pip install .` 即可安装。
 
 ## 许可证
 
