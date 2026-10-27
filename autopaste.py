@@ -74,6 +74,13 @@ MAX_PAYLOAD = 1 << 20        # 单次输入上限 1 MiB，避免误喂超大文�
 MAX_DELAY = 5.0              # 每字符间隔上限 5s
 MAX_COUNTDOWN = 3600.0       # 倒计时上限 1h
 
+# ----------------------------------------------------------------- 历史常量
+#: 历史只保存"能原样重发"的内容：超限条目宁可不存，也不存半截/摘要
+HIST_MAX_ENTRIES = 300
+HIST_MAX_ENTRY_BYTES = 8 * 1024
+HIST_MAX_ENTRY_LINES = 200
+HIST_MAX_FILE_BYTES = 1 << 20
+
 # ----------------------------------------------------------------- 窗口常量
 WINDOW_ACTIVATE_TIMEOUT = 1.5    # 激活后轮询焦点确认的总时长（秒）
 FOCUS_POLL_INTERVAL = 0.05
@@ -1974,15 +1981,232 @@ def parse_combo(name: str) -> tuple[list[str], str]:
     return mods, tokens[-1].strip()
 
 
+# ------------------------------------------------------------------ 历史记录
+def _entry_lines(text: str) -> int:
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def default_history_path(env=None) -> str | None:
+    """$XDG_STATE_HOME/autopaste/history；环境不完整时返回 None（仅内存）。"""
+    env = os.environ if env is None else env
+    base = env.get("XDG_STATE_HOME") or ""
+    if base:
+        if not os.path.isabs(base):
+            return None             # 相对路径会落进 cwd：fail-closed
+    else:
+        home = env.get("HOME")
+        if not home or not os.path.isabs(home):
+            return None
+        base = os.path.join(home, ".local", "state")
+    return os.path.join(base, "autopaste", "history")
+
+
+class History:
+    """REPL 历史；``path=None`` 表示仅内存。
+
+    任何权限/属主/符号链接/IO 问题都只降级为"仅内存历史"并说明原因，
+    绝不"尽力而为"地写一个不安全的明文文件。
+    """
+
+    def __init__(self, path: str | None = None, *, euid=None):
+        self.path = path
+        self.entries: list[str] = []
+        self.skipped = 0
+        self.disabled_reason: str | None = None
+        self._euid = os.geteuid() if euid is None else euid
+        if path:
+            try:
+                self._load()
+            except OSError as e:
+                self._disable(f"历史不可用，已退化为仅内存：{e}")
+
+    # ---- 写入
+    def add(self, text: str) -> bool:
+        if not text or not text.strip():
+            return False
+        if len(text.encode("utf-8")) > HIST_MAX_ENTRY_BYTES:
+            return False
+        if _entry_lines(text) > HIST_MAX_ENTRY_LINES:
+            return False
+        if self.entries and self.entries[-1] == text:
+            return False
+        self.entries.append(text)
+        del self.entries[:-HIST_MAX_ENTRIES]
+        if self.path is not None and self.disabled_reason is None:
+            try:
+                self._append(text)
+            except OSError as e:
+                self._disable(f"历史写入失败，已退化为仅内存：{e}")
+        return True
+
+    # ---- 安全闸门
+    def _disable(self, why: str) -> None:
+        self.disabled_reason = why
+        sys.stderr.write(f"⚠  {why}\n")
+        sys.stderr.flush()
+
+    def _dir_problem(self, d: str) -> str | None:
+        try:
+            st = os.lstat(d)
+        except OSError as e:
+            return f"历史目录不可用（{e}）"
+        if not stat.S_ISDIR(st.st_mode):
+            return "历史目录不是目录（可能是符号链接）"
+        if st.st_uid != self._euid:
+            return "历史目录不属于当前用户"
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                return "历史目录对组/其他用户可写且无法收紧"
+        return None
+
+    @staticmethod
+    def _read_fd(fd: int, limit: int) -> bytes:
+        chunks = []
+        left = limit
+        while left > 0:
+            chunk = os.read(fd, min(left, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
+
+    # ---- 读写实现
+    def _load(self) -> None:
+        d = os.path.dirname(self.path)
+        if not os.path.isdir(d):
+            return                       # 首次 add() 才创建目录
+        problem = self._dir_problem(d)
+        if problem:
+            raise OSError(problem)
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise OSError(f"无法读取历史文件（{e}）")
+        compact = False
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError("历史文件不是普通文件")
+            if st.st_uid != self._euid:
+                raise OSError("历史文件不属于当前用户")
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    raise OSError("历史文件权限过宽且无法收紧")
+            if st.st_size > HIST_MAX_FILE_BYTES:
+                compact = True
+                os.lseek(fd, -HIST_MAX_FILE_BYTES, os.SEEK_END)
+                raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
+                # 丢弃被截断的首行
+                nl = raw.find(b"\n")
+                raw = raw[nl + 1:] if nl >= 0 else b""
+            else:
+                raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
+        finally:
+            os.close(fd)
+        for line in raw.splitlines():
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self.skipped += 1
+                continue
+            text = obj.get("t") if isinstance(obj, dict) else None
+            if (not isinstance(obj, dict) or obj.get("v") != 1
+                    or not isinstance(text, str)
+                    or len(text.encode("utf-8")) > HIST_MAX_ENTRY_BYTES
+                    or _entry_lines(text) > HIST_MAX_ENTRY_LINES):
+                self.skipped += 1
+                continue
+            self.entries.append(text)
+        del self.entries[:-HIST_MAX_ENTRIES]
+        if compact:
+            try:
+                self._compact()
+            except OSError as e:
+                self._disable(f"历史压缩失败，已退化为仅内存：{e}")
+
+    def _append(self, text: str) -> None:
+        d = os.path.dirname(self.path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        problem = self._dir_problem(d)
+        if problem:
+            raise OSError(problem)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | os.O_NOFOLLOW, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError("历史文件不是普通文件")
+            if st.st_uid != self._euid:
+                raise OSError("历史文件不属于当前用户")
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    raise OSError("历史文件权限过宽且无法收紧")
+            data = (json.dumps({"v": 1, "t": text}, ensure_ascii=False)
+                    + "\n").encode("utf-8")
+            while data:
+                n = os.write(fd, data)
+                if n <= 0:
+                    raise OSError("历史写入未完成")
+                data = data[n:]
+        finally:
+            os.close(fd)
+
+    def _compact(self) -> None:
+        d = os.path.dirname(self.path)
+        tmp = os.path.join(
+            d, f".{os.path.basename(self.path)}.autopaste-{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW, 0o600)
+        try:
+            for text in self.entries[-HIST_MAX_ENTRIES:]:
+                data = (json.dumps({"v": 1, "t": text}, ensure_ascii=False)
+                        + "\n").encode("utf-8")
+                while data:
+                    n = os.write(fd, data)
+                    if n <= 0:
+                        raise OSError("历史压缩写入未完成")
+                    data = data[n:]
+        except OSError:
+            os.close(fd)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.close(fd)
+        try:
+            os.replace(tmp, self.path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
 # ------------------------------------------------------------------ 行编辑器
 class LineEditor:
-    """cbreak 模式下的最小行编辑器：方向键 / Home / End / 退格 / 括号粘贴"""
+    """cbreak 模式下的最小行编辑器：方向键 / Home / End / 退格 / 括号粘贴 / 历史"""
 
-    def __init__(self, fd: int):
+    def __init__(self, fd: int, history=None):
         self.fd = fd
+        self.history = history if history is not None else []
         self.buf: list[str] = []
         self.pos = 0
         self.paste: str | None = None
+        self.paste_origin = "paste"      # "paste" | "history"
+        self.hist_i = len(self.history)
+        self.hist_draft: str | None = None
+        self.hist_prefix: str | None = None
 
     def _w(self, s: str) -> None:
         sys.stdout.write(s)
@@ -2065,7 +2289,12 @@ class LineEditor:
             nlines = self.paste.count("\n") + 1
             if self.paste.endswith("\n"):
                 nlines -= 1
-            display = f"[已粘贴 {len(self.paste)} 字符 / {nlines} 行]"
+            if self.paste_origin == "history":
+                label, hint = "历史", "回车重发，退格清除"
+            else:
+                label, hint = "已粘贴", "退格清除"
+            display = (f"[{label} {len(self.paste)} 字符 / {nlines} 行"
+                       f"（{hint}）]")
             tail = 0
         else:
             display = "".join(self.buf)
@@ -2074,8 +2303,55 @@ class LineEditor:
         if tail:
             self._w(f"\x1b[{tail}D")
 
+    # ---- 历史导航
+    def _load_text(self, text: str, origin: str) -> None:
+        if "\n" in text:
+            # 多行条目复用"折叠粘贴"显示：_render 的宽度模型不支持内嵌换行
+            self.paste, self.paste_origin = text, origin
+            self.buf, self.pos = [], 0
+        else:
+            self.buf, self.pos = list(text), len(text)
+            self.paste, self.paste_origin = None, "paste"
+
+    def _history_visible(self) -> bool:
+        return self.paste is None or self.paste_origin == "history"
+
+    def _hist_up(self) -> None:
+        if not self._history_visible():
+            return
+        if self.hist_prefix is None:
+            self.hist_prefix = "".join(self.buf)
+            self.hist_draft = self.hist_prefix
+        j = self.hist_i - 1
+        while j >= 0:
+            if self.history[j].startswith(self.hist_prefix):
+                self.hist_i = j
+                self._load_text(self.history[j], "history")
+                return
+            j -= 1
+
+    def _hist_down(self) -> None:
+        if not self._history_visible() or self.hist_prefix is None:
+            return
+        j = self.hist_i + 1
+        while j < len(self.history):
+            if self.history[j].startswith(self.hist_prefix):
+                self.hist_i = j
+                self._load_text(self.history[j], "history")
+                return
+            j += 1
+        draft = self.hist_draft or ""
+        self.hist_i = len(self.history)
+        self.hist_prefix = None
+        self.hist_draft = None
+        self._load_text(draft, "paste")
+
     def read(self, prompt: str) -> tuple[str, str | None]:
         self.buf, self.pos, self.paste = [], 0, None
+        self.paste_origin = "paste"
+        self.hist_i = len(self.history)
+        self.hist_draft = None
+        self.hist_prefix = None
         self._render(prompt)
         while True:
             c = self._read_byte()
@@ -2086,7 +2362,12 @@ class LineEditor:
                 seq = self._read_esc()
                 if seq == "[200~":
                     self.paste = self._read_paste()
+                    self.paste_origin = "paste"
                     self.buf, self.pos = [], 0
+                elif seq in ("[A", "OA"):
+                    self._hist_up()
+                elif seq in ("[B", "OB"):
+                    self._hist_down()
                 elif seq in ("[D", "OD"):
                     self.pos = max(0, self.pos - 1)
                 elif seq in ("[C", "OC"):
@@ -2132,9 +2413,14 @@ class LineEditor:
                 continue
             if c == 0x15:
                 self.buf, self.pos = [], 0
+                self.paste = None
                 self._render(prompt)
                 continue
             if c == 0x17:
+                if self.paste is not None and not self.buf:
+                    self.paste = None
+                    self._render(prompt)
+                    continue
                 while self.pos > 0 and self.buf[self.pos - 1] == " ":
                     del self.buf[self.pos - 1]
                     self.pos -= 1
@@ -2143,7 +2429,18 @@ class LineEditor:
                     self.pos -= 1
                 self._render(prompt)
                 continue
+            if c == 0x10:                    # Ctrl-P = ↑（必须早于 c<0x20）
+                self._hist_up()
+                self._render(prompt)
+                continue
+            if c == 0x0E:                    # Ctrl-N = ↓
+                self._hist_down()
+                self._render(prompt)
+                continue
             if c < 0x20:
+                continue
+            if self.paste is not None:
+                # 回忆/粘贴态下打字会被忽略（否则看起来输入了、提交的却是旧内容）
                 continue
             if c < 0x80:
                 ch = chr(c)
@@ -2224,6 +2521,7 @@ BANNER = """\
 autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任何引号/转义问题
   :s 3 倒计时 | :d 0.02 每字间隔 | :nl 自动回车 | :k 组合键 | :f 文件
   :r 重复上次 | :t 状态/目标窗口 | :w 定向窗口 | :h 帮助 | :q 退出
+  ↑/↓ 历史（行内前缀搜索，↓ 回到草稿）
 """
 
 HELP = """\
@@ -2236,6 +2534,7 @@ HELP = """\
   :r              重复上一次提交的内容
   :t              查看当前设置与目标窗口
   :w <pattern>    设置定向窗口（class:/title:/pid:/re:），:w - 清除
+  ↑ / ↓           上一条/下一条历史（先输入前缀可过滤；↓ 回到草稿）
   :h              显示本帮助
   :q              退出
 
@@ -2243,10 +2542,11 @@ HELP = """\
 """
 
 
-def repl(typer: Typer, cfg: Settings) -> int:
+def repl(typer: Typer, cfg: Settings,
+         history: "History | None" = None) -> int:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    ed = LineEditor(fd)
+    ed = LineEditor(fd, history=None if history is None else history.entries)
     last: str | None = None
     #: 本轮提交实际激活的目标窗口（None = 不定向，敲当前焦点）
     focus_target: WindowInfo | None = None
@@ -2319,6 +2619,8 @@ def repl(typer: Typer, cfg: Settings) -> int:
                 cmd = text[1:].strip()
                 name, _, arg = cmd.partition(" ")
                 name, arg = name.lower(), arg.strip()
+                if history is not None:
+                    history.add(text)
                 try:
                     if name in ("q", "quit", "exit"):
                         break
@@ -2382,6 +2684,8 @@ def repl(typer: Typer, cfg: Settings) -> int:
             except Abort as e:
                 sys.stdout.write(f"  已拦截: {e}\n")
                 continue
+            if history is not None:
+                history.add(text)
             last = text
             warn_multiline_target(typer, text)
             if (activate() and countdown(cfg.sleep, typer)
@@ -2500,6 +2804,8 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
     ap.add_argument("--no-clipboard-backup", "--no-restore-clipboard",
                     dest="no_clipboard_backup", action="store_true",
                     help="不备份/不恢复原剪贴板（默认 fail-closed：备份失败即停止）")
+    ap.add_argument("--no-history", action="store_true",
+                    help="不读写 REPL 历史文件（默认保存到 XDG state 目录）")
     ap.add_argument("--allow-root", action="store_true",
                     help="允许以 root 运行（不推荐）")
     ap.add_argument("-V", "--version", action="version",
@@ -2682,8 +2988,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
                            delay=delay, window=args.window)
+            history = None
+            if not args.no_history:
+                history = History(default_history_path())
             typer = Typer(backend=args.backend, delay=cfg.delay)
-            return repl(typer, cfg)
+            return repl(typer, cfg, history=history)
 
         # ---- 组装输入
         if args.file:

@@ -68,7 +68,7 @@ class ReplTyper:
         pass
 
 
-def run_repl(data: bytes, *, typer, cfg):
+def run_repl(data: bytes, *, typer, cfg, history=None):
     """把 data 喂给 repl，返回退出码。"""
     rfd, wfd = os.pipe()
     try:
@@ -85,7 +85,7 @@ def run_repl(data: bytes, *, typer, cfg):
                 mock.patch.object(autopaste.tty, "setcbreak"), \
                 mock.patch.object(autopaste, "countdown", return_value=True), \
                 redirect_std() as (out, err):
-            code = autopaste.repl(typer, cfg)
+            code = autopaste.repl(typer, cfg, history=history)
         return code, out.getvalue(), err.getvalue()
     finally:
         raw.close()
