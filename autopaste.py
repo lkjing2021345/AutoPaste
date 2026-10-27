@@ -489,6 +489,112 @@ class X11Backend(Backend):
             pass
 
 
+# ------------------------------------------------------------- 外部命令接缝
+def _run(argv, *, capture_stdout: bool = False):
+    """所有外部命令的唯一出口（测试可整体打桩）。
+
+    始终 check=False：由后端解析返回码并给出可读错误，绝不经过 shell。
+    """
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def _delay_ms(delay: float) -> int:
+    """秒 -> 毫秒整数；0 表示不传 -d（避免不同 wtype/ydotool 版本语义差异）。"""
+    if delay <= 0:
+        return 0
+    return max(1, int(round(min(delay, MAX_DELAY) * 1000)))
+
+
+def _chunks(text: str, limit: int):
+    """按 UTF-8 字节数分片，且绝不在多字节字符中间切断。"""
+    buf: list[str] = []
+    size = 0
+    for ch in text:
+        n = len(ch.encode("utf-8"))
+        if buf and size + n > limit:
+            yield "".join(buf)
+            buf, size = [], 0
+        buf.append(ch)
+        size += n
+    if buf:
+        yield "".join(buf)
+
+
+class WtypeBackend(Backend):
+    """通过 wtype 向 Wayland 合成器注入按键（虚拟键盘协议）。"""
+
+    name = "wtype"
+    MAX_ARG = 32 * 1024            # 远低于 Linux 单参数 128 KiB 上限
+    _PROTO_ERR = ("virtual keyboard", "protocol", "not supported",
+                  "failed to create")
+
+    def __init__(self, delay: float = 0.008, *, which=None, env=None,
+                 runner=None):
+        which = shutil.which if which is None else which
+        if not which("wtype"):
+            raise BackendUnavailable(
+                "未找到 wtype。\n" + _missing_hint("wayland"))
+        self.delay = delay
+        self._run = runner or _run
+
+    # ------------------------------------------------------------- 内部
+    def _delay_args(self) -> list[str]:
+        ms = _delay_ms(self.delay)
+        return [] if ms == 0 else ["-d", str(ms)]
+
+    def _exec(self, args: list[str]) -> None:
+        argv = ["wtype", *self._delay_args(), *args]
+        try:
+            cp = self._run(argv)
+        except FileNotFoundError:
+            raise BackendUnavailable(
+                "未找到 wtype（PATH 可能不完整）。\n" + _missing_hint("wayland"))
+        rc = getattr(cp, "returncode", 0)
+        if rc != 0:
+            stderr = (getattr(cp, "stderr", "") or "").strip().splitlines()
+            err = stderr[-1][:200] if stderr else "无输出"
+            hint = ""
+            low = err.lower()
+            if any(mark in low for mark in self._PROTO_ERR):
+                hint = ("（当前合成器可能不支持 virtual-keyboard 协议；"
+                        "GNOME/mutter 请改用 --backend ydotool）")
+            raise BackendError(f"wtype 失败（退出码 {rc}）：{err}{hint}")
+
+    # ------------------------------------------------------------- 注入
+    def type_text(self, text: str) -> None:
+        if not text:
+            return
+        for chunk in _chunks(text, self.MAX_ARG):
+            self._exec(["--", chunk])
+
+    def press(self, combo: str) -> None:
+        mods, key = parse_combo(combo)
+        low = key.lower()
+        if low in MODIFIERS:
+            key = MODIFIERS[low]
+        elif low in SPECIAL:
+            key = SPECIAL[low]
+        args: list[str] = []
+        for mod in mods:
+            args += ["-M", mod]
+        args += ["-k", key]
+        for mod in reversed(mods):
+            args += ["-m", mod]
+        self._exec(args)
+
+    def capabilities(self) -> dict:
+        return {"name": self.name, "can_focus_info": False,
+                "can_paste_mode": False, "unicode": True,
+                "needs_remap": False, "combos": True,
+                "per_char_delay": True, "daemon": False}
+
+
 # ------------------------------------------------------------- 后端选择
 def detect_session(env=None) -> str:
     """返回 "x11" / "wayland" / "unknown"。
@@ -524,14 +630,18 @@ def _missing_hint(session: str) -> str:
 
 
 def choose_backend(requested: str = "auto", env=None, which=None) -> str:
-    """把 --backend 的取值解析成具体后端名；auto 只在本版本支持的范围内选择。"""
+    """把 --backend 的取值解析成具体后端名。"""
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     if requested != "auto":
         return requested
-    if detect_session(env) == "x11":
+    session = detect_session(env)
+    if session == "x11":
         return "x11"
-    raise BackendUnavailable(_missing_hint(detect_session(env)))
+    if session == "wayland":
+        if which("wtype"):
+            return "wtype"
+    raise BackendUnavailable(_missing_hint(session))
 
 
 def make_backend(name: str = "auto", *, delay: float = 0.008,
@@ -540,6 +650,8 @@ def make_backend(name: str = "auto", *, delay: float = 0.008,
     resolved = choose_backend(name, env=env, which=which)
     if resolved == "x11":
         return X11Backend(delay=delay, remap_wait=remap_wait)
+    if resolved == "wtype":
+        return WtypeBackend(delay=delay, which=which, env=env, runner=runner)
     raise BackendUnavailable(f"未知后端: {resolved}")
 
 
@@ -1007,8 +1119,9 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                     help="跳过确认提示（终端目标 + 多行文本时使用）")
     ap.add_argument("--allow-control", action="store_true",
                     help="允许输入控制字符（ESC 等），确认安全后再用")
-    ap.add_argument("--backend", choices=("auto", "x11"), default="auto",
-                    help="键盘注入后端：auto|x11（Wayland 后端见后续版本），默认 auto")
+    ap.add_argument("--backend", choices=("auto", "x11", "wtype"),
+                    default="auto",
+                    help="键盘注入后端：auto|x11|wtype，默认 auto")
     ap.add_argument("--list-backends", action="store_true",
                     help="列出各后端可用性与探测依据后退出")
     ap.add_argument("--allow-root", action="store_true",
@@ -1047,26 +1160,63 @@ def _confirm(question: str) -> bool:
     return ans in ("y", "yes")
 
 
-def format_backends(env=None) -> str:
+def _tool_version(name: str, which=None, runner=None) -> str | None:
+    """返回工具版本行；未安装返回 None，探测失败返回空串。"""
+    which = shutil.which if which is None else which
+    if not which(name):
+        return None
+    run = runner or _run
+    try:
+        cp = run([name, "--version"], capture_stdout=True)
+        if getattr(cp, "returncode", 1) == 0:
+            out = (getattr(cp, "stdout", "") or "").strip().splitlines()
+            if out:
+                return out[0][:60]
+    except Exception:
+        pass
+    return ""
+
+
+def format_backends(env=None, which=None, runner=None) -> str:
     """`--list-backends` 的诊断输出：可用性 + 探测依据。"""
     env = os.environ if env is None else env
+    which = shutil.which if which is None else which
     session = detect_session(env)
+    rows = []
+
+    libs_note = ""
     try:
         _load_x11()
-        x11_ok, x11_why = True, (f"DISPLAY={env.get('DISPLAY') or '(未设置)'}，"
-                                 "libX11/libXtst 可加载")
+        libs_ok = True
     except Exception as e:
-        x11_ok, x11_why = False, str(e).splitlines()[0]
-    lines = [
-        "后端      可用  探测依据",
-        f"x11       {'是' if x11_ok else '否'}    {x11_why}",
-        f"当前会话: {session}",
-    ]
+        libs_ok = False
+        libs_note = str(e).splitlines()[0]
+    if not env.get("DISPLAY"):
+        x11_ok, x11_why = False, f"DISPLAY 未设置；{libs_note or 'libX11/libXtst 可加载'}"
+    elif not libs_ok:
+        x11_ok, x11_why = False, libs_note
+    else:
+        x11_ok = True
+        x11_why = f"DISPLAY={env.get('DISPLAY')}，libX11/libXtst 可加载"
+    rows.append(("x11", x11_ok, x11_why))
+
+    wver = _tool_version("wtype", which=which, runner=runner)
+    if wver is None:
+        rows.append(("wtype", False, "未在 PATH 找到"))
+    else:
+        rows.append(("wtype", True,
+                     "PATH=" + (which("wtype") or "") +
+                     (f"，版本 {wver}" if wver else "")))
+
+    out = ["后端      可用  探测依据"]
+    for name, ok, why in rows:
+        out.append(f"{name:<9} {'是' if ok else '否'}    {why}")
+    out.append(f"当前会话: {session}")
     try:
-        lines.append(f"auto 将选择: {choose_backend('auto', env=env)}")
+        out.append(f"auto 将选择: {choose_backend('auto', env=env, which=which)}")
     except BackendUnavailable:
-        lines.append("auto 将选择: （无可用后端）")
-    return "\n".join(lines) + "\n"
+        out.append("auto 将选择: （无可用后端）")
+    return "\n".join(out) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
