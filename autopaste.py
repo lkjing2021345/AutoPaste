@@ -2133,21 +2133,59 @@ class History:
         self.disabled_reason = why
         LOG.warn(why)
 
-    def _dir_problem(self, d: str) -> str | None:
+    def _dir_problem(self, fd: int) -> str | None:
         try:
-            st = os.lstat(d)
+            st = os.fstat(fd)
         except OSError as e:
             return f"历史目录不可用（{e}）"
         if not stat.S_ISDIR(st.st_mode):
-            return "历史目录不是目录（可能是符号链接）"
+            return "历史目录不是目录"
         if st.st_uid != self._euid:
             return "历史目录不属于当前用户"
         if stat.S_IMODE(st.st_mode) & 0o022:
             try:
-                os.chmod(d, 0o700)
+                os.fchmod(fd, 0o700)
             except OSError:
                 return "历史目录对组/其他用户可写且无法收紧"
         return None
+
+    def _open_dir(self, path: str, create: bool = False) -> int:
+        """从 / 逐级打开目录；任一级是符号链接即失败（fail-closed）。
+
+        只对最后一级 ``lstat`` 不够：``$XDG_STATE_HOME`` 或它的祖先被换成
+        符号链接时，``O_NOFOLLOW`` 保护不到最终文件（R_04 M3）。
+        """
+        if not os.path.isabs(path):
+            raise OSError("历史目录不是绝对路径")
+        parts = [p for p in os.path.normpath(path).split(os.sep) if p]
+        try:
+            fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as e:
+            raise OSError(f"历史目录不可用（{e}）") from None
+        try:
+            for part in parts:
+                try:
+                    nfd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                        | os.O_CLOEXEC, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    nfd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                        | os.O_CLOEXEC, dir_fd=fd)
+                os.close(fd)
+                fd = nfd
+            return fd
+        except OSError as e:
+            os.close(fd)
+            if isinstance(e, FileNotFoundError):
+                raise                  # 交给调用方决定"首次创建"还是报错
+            raise OSError(f"历史目录不可用（{e}）") from None
+        except BaseException:
+            os.close(fd)
+            raise
 
     @staticmethod
     def _read_fd(fd: int, limit: int) -> bytes:
@@ -2156,40 +2194,48 @@ class History:
     # ---- 读写实现
     def _load(self) -> None:
         d = os.path.dirname(self.path)
-        if not os.path.isdir(d):
-            return                       # 首次 add() 才创建目录
-        problem = self._dir_problem(d)
-        if problem:
-            raise OSError(problem)
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            dfd = self._open_dir(d)
         except FileNotFoundError:
-            return
+            return                       # 首次 add() 才创建目录
         except OSError as e:
-            raise OSError(f"无法读取历史文件（{e}）")
-        compact = False
+            raise OSError(str(e)) from None
         try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError("历史文件不是普通文件")
-            if st.st_uid != self._euid:
-                raise OSError("历史文件不属于当前用户")
-            if stat.S_IMODE(st.st_mode) & 0o077:
-                try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    raise OSError("历史文件权限过宽且无法收紧")
-            if st.st_size > HIST_MAX_FILE_BYTES:
-                compact = True
-                os.lseek(fd, -HIST_MAX_FILE_BYTES, os.SEEK_END)
-                raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
-                # 丢弃被截断的首行
-                nl = raw.find(b"\n")
-                raw = raw[nl + 1:] if nl >= 0 else b""
-            else:
-                raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
+            problem = self._dir_problem(dfd)
+            if problem:
+                raise OSError(problem)
+            try:
+                fd = os.open(os.path.basename(self.path),
+                             os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            except FileNotFoundError:
+                return
+            except OSError as e:
+                raise OSError(f"无法读取历史文件（{e}）") from None
+            compact = False
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("历史文件不是普通文件")
+                if st.st_uid != self._euid:
+                    raise OSError("历史文件不属于当前用户")
+                if stat.S_IMODE(st.st_mode) & 0o077:
+                    try:
+                        os.fchmod(fd, 0o600)
+                    except OSError:
+                        raise OSError("历史文件权限过宽且无法收紧")
+                if st.st_size > HIST_MAX_FILE_BYTES:
+                    compact = True
+                    os.lseek(fd, -HIST_MAX_FILE_BYTES, os.SEEK_END)
+                    raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
+                    # 丢弃被截断的首行
+                    nl = raw.find(b"\n")
+                    raw = raw[nl + 1:] if nl >= 0 else b""
+                else:
+                    raw = self._read_fd(fd, HIST_MAX_FILE_BYTES)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
+            os.close(dfd)
         for line in raw.splitlines():
             try:
                 obj = json.loads(line.decode("utf-8"))
@@ -2213,64 +2259,75 @@ class History:
 
     def _append(self, text: str) -> None:
         d = os.path.dirname(self.path)
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        problem = self._dir_problem(d)
-        if problem:
-            raise OSError(problem)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
-                     | os.O_NOFOLLOW, 0o600)
         try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError("历史文件不是普通文件")
-            if st.st_uid != self._euid:
-                raise OSError("历史文件不属于当前用户")
-            if stat.S_IMODE(st.st_mode) & 0o077:
-                try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    raise OSError("历史文件权限过宽且无法收紧")
-            data = (json.dumps({"v": 1, "t": text}, ensure_ascii=False)
-                    + "\n").encode("utf-8")
-            while data:
-                n = os.write(fd, data)
-                if n <= 0:
-                    raise OSError("历史写入未完成")
-                data = data[n:]
-        finally:
-            os.close(fd)
-
-    def _compact(self) -> None:
-        d = os.path.dirname(self.path)
-        tmp = os.path.join(
-            d, f".{os.path.basename(self.path)}.autopaste-{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                     | os.O_NOFOLLOW, 0o600)
+            dfd = self._open_dir(d, create=True)
+        except OSError as e:
+            raise OSError(str(e)) from None
         try:
-            for text in self.entries[-HIST_MAX_ENTRIES:]:
+            problem = self._dir_problem(dfd)
+            if problem:
+                raise OSError(problem)
+            fd = os.open(os.path.basename(self.path),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                         0o600, dir_fd=dfd)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("历史文件不是普通文件")
+                if st.st_uid != self._euid:
+                    raise OSError("历史文件不属于当前用户")
+                if stat.S_IMODE(st.st_mode) & 0o077:
+                    try:
+                        os.fchmod(fd, 0o600)
+                    except OSError:
+                        raise OSError("历史文件权限过宽且无法收紧")
                 data = (json.dumps({"v": 1, "t": text}, ensure_ascii=False)
                         + "\n").encode("utf-8")
                 while data:
                     n = os.write(fd, data)
                     if n <= 0:
-                        raise OSError("历史压缩写入未完成")
+                        raise OSError("历史写入未完成")
                     data = data[n:]
-        except OSError:
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dfd)
+
+    def _compact(self) -> None:
+        d = os.path.dirname(self.path)
+        dfd = self._open_dir(d)
+        try:
+            tmp = f".{os.path.basename(self.path)}.autopaste-{os.getpid()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            try:
+                for text in self.entries[-HIST_MAX_ENTRIES:]:
+                    data = (json.dumps({"v": 1, "t": text}, ensure_ascii=False)
+                            + "\n").encode("utf-8")
+                    while data:
+                        n = os.write(fd, data)
+                        if n <= 0:
+                            raise OSError("历史压缩写入未完成")
+                        data = data[n:]
+            except OSError:
+                os.close(fd)
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
             os.close(fd)
             try:
-                os.unlink(tmp)
+                os.replace(tmp, os.path.basename(self.path),
+                           src_dir_fd=dfd, dst_dir_fd=dfd)
             except OSError:
-                pass
-            raise
-        os.close(fd)
-        try:
-            os.replace(tmp, self.path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dfd)
 
 
 # ------------------------------------------------------------------ 行编辑器

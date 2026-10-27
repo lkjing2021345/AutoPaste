@@ -221,6 +221,34 @@ class HistoryStoreTests(unittest.TestCase):
         h.add("x")
         self.assertEqual(os.listdir(outside), [])
 
+    def test_history_symlinked_ancestor_disabled(self):
+        """$XDG_STATE_HOME 本身被换成符号链接也必须 fail-closed（R_04 M3）。"""
+        outside = os.path.join(self.dir, "outside_dir")
+        os.makedirs(outside)
+        link = os.path.join(self.dir, "state")
+        os.symlink(outside, link)
+        path = os.path.join(link, "autopaste", "history")
+        with redirect_std():
+            h = autopaste.History(path)
+        self.assertIsNotNone(h.disabled_reason)
+        self.assertIn("历史目录", h.disabled_reason)
+        self.assertTrue(h.add("x"))
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_history_write_refuses_symlinked_ancestor(self):
+        """目录在初始化后、首次写入前被换成符号链接，也不能写穿。"""
+        h = autopaste.History(self.path)
+        self.assertIsNone(h.disabled_reason)
+        outside = os.path.join(self.dir, "outside_dir")
+        os.makedirs(outside)
+        os.makedirs(os.path.dirname(self.path), mode=0o700)
+        os.rmdir(os.path.dirname(self.path))
+        os.symlink(outside, os.path.dirname(self.path))
+        with redirect_std():
+            self.assertTrue(h.add("x"))
+        self.assertIsNotNone(h.disabled_reason)
+        self.assertEqual(os.listdir(outside), [])
+
 
 class ReplHistoryWiringTests(unittest.TestCase):
     def test_repl_records_submitted_text(self):
