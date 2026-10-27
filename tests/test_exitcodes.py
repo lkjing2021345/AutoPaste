@@ -108,7 +108,7 @@ class UncaughtExceptionFixesTests(unittest.TestCase):
     def test_repl_requires_tty_exits_2(self):
         with temp_home(), \
                 mock.patch.object(autopaste, "Typer") as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(sys.stdin, "isatty", return_value=False), \

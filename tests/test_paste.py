@@ -227,7 +227,7 @@ class MainPasteTests(unittest.TestCase):
         factory = mock.Mock(return_value=None if clip_missing else clip)
         with temp_home(), \
                 mock.patch.object(autopaste, "Typer") as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(autopaste, "countdown", return_value=True), \

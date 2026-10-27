@@ -81,7 +81,7 @@ class QuietCountdownTests(unittest.TestCase):
                 "window_control": False}
         with temp_home(), \
                 mock.patch.object(autopaste, "Typer") as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(autopaste, "_confirm",
@@ -105,7 +105,7 @@ class QuietCountdownTests(unittest.TestCase):
         log = autopaste.Log(autopaste.Log.VERBOSE, err=io.StringIO())
         with temp_home(), \
                 mock.patch.object(autopaste, "Typer") as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(autopaste, "LOG", log), \

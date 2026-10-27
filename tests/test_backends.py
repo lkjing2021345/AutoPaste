@@ -575,7 +575,7 @@ class CliBackendTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 "XDG_SESSION_TYPE": "wayland",
                 "WAYLAND_DISPLAY": "wl-0"}, clear=True), \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.object(autopaste.shutil, "which",
                                   return_value=None), \
@@ -591,7 +591,7 @@ class CliBackendTests(unittest.TestCase):
     def test_wayland_multiline_requires_confirm(self):
         with temp_home(), \
                 self._mock_wayland_typer() as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.object(autopaste, "_confirm",
                                   return_value=False), \
@@ -610,7 +610,7 @@ class CliBackendTests(unittest.TestCase):
     def test_wayland_multiline_with_yes_proceeds(self):
         with temp_home(), \
                 self._mock_wayland_typer() as typer_cls, \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 redirect_std():
             typer_cls.return_value.capabilities.return_value = {

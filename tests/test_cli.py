@@ -38,7 +38,7 @@ class MainExitCodeTests(unittest.TestCase):
         self.typer_cls = None
         with temp_home(), \
                 mock.patch.dict(os.environ, env, clear=False), \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 redirect_std() as (out, err):
             if mock_typer:
@@ -67,7 +67,7 @@ class MainExitCodeTests(unittest.TestCase):
     def test_missing_backend_exits_2(self):
         # 无 X11、无 Wayland 工具 -> 环境类拒绝，退出码 2 且给出安装提示
         with mock.patch.dict(os.environ, clear=True), \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.object(autopaste.shutil, "which",
                                   return_value=None), \

@@ -85,7 +85,7 @@ class EntryPointTests(unittest.TestCase):
                 mock.patch.object(autopaste, "Typer", FakeTyper), \
                 mock.patch.object(autopaste, "atexit") as atexit_mock, \
                 mock.patch.object(autopaste, "countdown", fake_countdown), \
-                mock.patch.object(os, "geteuid", return_value=1000,
+                mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                   create=True), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 redirect_std() as (_, err):

@@ -210,7 +210,7 @@ class MainConfigTests(unittest.TestCase):
                     write_config(home, config, mode=mode)
             log = autopaste.Log(autopaste.Log.VERBOSE, err=io.StringIO())
             with mock.patch.object(autopaste, "Typer") as typer_cls, \
-                    mock.patch.object(os, "geteuid", return_value=1000,
+                    mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                       create=True), \
                     mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                     mock.patch.object(autopaste, "LOG", log), \
@@ -283,7 +283,7 @@ class MainConfigTests(unittest.TestCase):
             typer_inst = test_repl.ReplTyper()
             with mock.patch.object(autopaste, "Typer",
                                    return_value=typer_inst), \
-                    mock.patch.object(os, "geteuid", return_value=1000,
+                    mock.patch.object(os, "geteuid", return_value=(os.geteuid() or 1),
                                       create=True), \
                     mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                     mock.patch.object(autopaste.sys, "stdin",
