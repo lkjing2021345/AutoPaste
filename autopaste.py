@@ -45,9 +45,13 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import ctypes
 import ctypes.util
+import dataclasses
+import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -65,6 +69,21 @@ __version__ = "1.0.0"
 MAX_PAYLOAD = 1 << 20        # 单次输入上限 1 MiB，避免误喂超大文件/管道
 MAX_DELAY = 5.0              # 每字符间隔上限 5s
 MAX_COUNTDOWN = 3600.0       # 倒计时上限 1h
+
+# ----------------------------------------------------------------- 窗口常量
+WINDOW_ACTIVATE_TIMEOUT = 1.5    # 激活后轮询焦点确认的总时长（秒）
+FOCUS_POLL_INTERVAL = 0.05
+FOCUS_WALK_LIMIT = 32            # 焦点沿 parent 链向上找的最大层数
+TITLE_MAX_BYTES = 8 * 1024       # 单个窗口标题读取上限
+PROP_MAX_ITEMS = 64              # EWMH 窗口列表最多取 64 项
+X_CLIENT_MESSAGE = 33
+SUBSTRUCT_MASK = 0x00080000 | 0x00100000   # SubstructureNotify|Redirect
+#: 这些窗口类型不是键盘输入目标（对话框/工具窗口保留）。
+SKIP_WINDOW_TYPES = {
+    "_NET_WM_WINDOW_TYPE_DESKTOP", "_NET_WM_WINDOW_TYPE_DOCK",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP", "_NET_WM_WINDOW_TYPE_MENU",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+}
 
 # 会把换行当"执行"的终端程序（按 WM_CLASS，小写比较）
 TERMINAL_CLASSES = {
@@ -90,6 +109,46 @@ class XClassHint(ctypes.Structure):
     # 强行 cast 会 free 掉 Python 自己的内存 (glibc: invalid size)。
     _fields_ = [("res_name", P(ctypes.c_char)),
                 ("res_class", P(ctypes.c_char))]
+
+
+class XWindowAttributes(ctypes.Structure):
+    # 只用到 map_state / override_redirect，但必须按 libX11 的完整布局声明，
+    # 否则字段偏移全错（读到随机的"映射状态"）。
+    _fields_ = [
+        ("x", ctypes.c_int), ("y", ctypes.c_int),
+        ("width", ctypes.c_int), ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+        ("class_", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int), ("screen", ctypes.c_void_p),
+    ]
+
+
+class XClientMessageData(ctypes.Union):
+    _fields_ = [("b", ctypes.c_char * 20),
+                ("s", ctypes.c_short * 10),
+                ("l", ctypes.c_long * 5)]
+
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong),
+                ("message_type", ctypes.c_ulong), ("format", ctypes.c_int),
+                ("data", XClientMessageData)]
+
+
+class XEvent(ctypes.Union):
+    # Xlib 的 XEvent 在 LP64 上是 24 个 long（192 字节）；缓冲区必须够大，
+    # 否则 XSendEvent 会越界读写。
+    _fields_ = [("type", ctypes.c_int), ("xclient", XClientMessageEvent),
+                ("pad", ctypes.c_long * 24)]
 
 
 def _load_x11() -> None:
@@ -133,6 +192,34 @@ def _load_x11() -> None:
                                   P(ctypes.c_char_p)]
     libx11.XGetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
                                      P(XClassHint)]
+
+    # ---- 窗口枚举/激活（03.1）
+    libx11.XDefaultRootWindow.restype = ctypes.c_ulong
+    libx11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    libx11.XInternAtom.restype = ctypes.c_ulong
+    libx11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                   ctypes.c_int]
+    libx11.XGetWindowProperty.restype = ctypes.c_int
+    libx11.XGetWindowProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+        ctypes.c_long, ctypes.c_int, ctypes.c_ulong, P(ctypes.c_ulong),
+        P(ctypes.c_int), P(ctypes.c_ulong), P(ctypes.c_ulong),
+        P(P(ctypes.c_ubyte))]
+    libx11.XQueryTree.restype = ctypes.c_int
+    libx11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                  P(ctypes.c_ulong), P(ctypes.c_ulong),
+                                  P(P(ctypes.c_ulong)), P(ctypes.c_uint)]
+    libx11.XGetWindowAttributes.restype = ctypes.c_int
+    libx11.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                            P(XWindowAttributes)]
+    libx11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    libx11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                      ctypes.c_int, ctypes.c_ulong]
+    libx11.XSendEvent.restype = ctypes.c_int
+    libx11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                  ctypes.c_int, ctypes.c_long, P(XEvent)]
+    libx11.XSetErrorHandler.restype = ctypes.c_void_p
+    libx11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
 
     libxtst.XTestFakeKeyEvent.restype = ctypes.c_int
     libxtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
@@ -179,6 +266,8 @@ KEYSYM_SHIFT = 0xFFE1  # Shift_L
 class Abort(Exception):
     """用户取消 / 安全检查拦截"""
 
+    code = 1
+
 
 class BackendError(Abort):
     """键盘后端运行期失败（外部工具报错等）"""
@@ -186,6 +275,26 @@ class BackendError(Abort):
 
 class BackendUnavailable(BackendError):
     """环境缺失：没装工具、没有会话、权限不足、socket 不存在等"""
+
+    code = 2
+
+
+class WindowUnavailable(Abort):
+    """--window 找不到目标、或激活/焦点确认失败（退出码 2）"""
+
+    code = 2
+
+
+class WindowCancelled(Abort):
+    """用户在候选列表里取消（退出码 3）"""
+
+    code = 3
+
+
+class ClipboardUnsafe(Abort):
+    """剪贴板无法安全备份，拒绝覆盖（退出码 2）"""
+
+    code = 2
 
 
 def _char_keysym(ch: str) -> int:
@@ -204,27 +313,14 @@ def focused_window(dpy) -> dict | None:
     """读取当前焦点窗口的标题/类名，用于让用户确认"会敲到哪里" """
     _require_x11()
     try:
-        win = ctypes.c_ulong()
-        rev = ctypes.c_int()
-        x11.XGetInputFocus(dpy, ctypes.byref(win), ctypes.byref(rev))
-        if win.value in (0, 1):          # None / PointerRoot
+        xid = focused_xid(dpy)
+        if xid is None:
             return None
-        title = None
-        name = ctypes.c_char_p()
-        if x11.XFetchName(dpy, win.value, ctypes.byref(name)):
-            title = _decode(name.value)
-            x11.XFree(ctypes.cast(name, ctypes.c_void_p))
-        cls = res_name = None
-        hint = XClassHint()
-        if x11.XGetClassHint(dpy, win.value, ctypes.byref(hint)):
-            if hint.res_name:
-                res_name = ctypes.string_at(hint.res_name).decode("utf-8", "replace")
-            if hint.res_class:
-                cls = ctypes.string_at(hint.res_class).decode("utf-8", "replace")
-            for f in (hint.res_name, hint.res_class):
-                if f:
-                    x11.XFree(ctypes.cast(f, ctypes.c_void_p))
-        return {"title": title, "name": res_name, "class": cls}
+        info = _window_info_raw(dpy, xid)
+        if info is None:
+            return None
+        return {"title": info.title or None, "name": info.instance or None,
+                "class": info.cls or None}
     except Exception:
         return None
 
@@ -248,6 +344,524 @@ def is_terminal(info: dict | None) -> bool:
         if v in TERMINAL_CLASSES:
             return True
     return False
+
+
+# ------------------------------------------------- 窗口枚举/匹配/激活（X11 专用）
+@dataclasses.dataclass(frozen=True)
+class WindowInfo:
+    """一个可定向的顶层客户端窗口。"""
+
+    xid: int
+    cls: str = ""            # WM_CLASS 第二段（res_class）
+    instance: str = ""       # WM_CLASS 第一段（res_name）
+    title: str = ""          # _NET_WM_NAME 优先，WM_NAME 兜底
+    pid: int | None = None
+    desktop: int | None = None
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def _root(dpy) -> int:
+    return x11.XDefaultRootWindow(dpy)
+
+
+def _atom(dpy, name: str, only_if_exists: bool = False) -> int:
+    return x11.XInternAtom(dpy, name.encode("ascii"), bool(only_if_exists))
+
+
+def _attrs(dpy, win: int):
+    """XGetWindowAttributes；窗口不存在返回 None（不抛）。"""
+    a = XWindowAttributes()
+    try:
+        if not x11.XGetWindowAttributes(dpy, win, ctypes.byref(a)):
+            return None
+    except Exception:
+        return None
+    return a
+
+
+def _prop(dpy, win: int, atom: int, max_bytes: int = TITLE_MAX_BYTES):
+    """读一个属性：format=32 返回 list[int]，format=8 返回 bytes，缺失 None。"""
+    if not atom:
+        return None
+    actual_type = ctypes.c_ulong(0)
+    actual_format = ctypes.c_int(0)
+    nitems = ctypes.c_ulong(0)
+    bytes_after = ctypes.c_ulong(0)
+    data = P(ctypes.c_ubyte)()
+    try:
+        status = x11.XGetWindowProperty(
+            dpy, win, atom, 0, max(1, max_bytes // 4), False, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after),
+            ctypes.byref(data))
+    except Exception:
+        return None
+    if status != 0 or not data:
+        if data:
+            x11.XFree(ctypes.cast(data, ctypes.c_void_p))
+        return None
+    try:
+        if actual_format.value == 32:
+            arr = ctypes.cast(data, P(ctypes.c_ulong))
+            return [int(arr[i]) for i in range(nitems.value)]
+        return ctypes.string_at(data, nitems.value)
+    finally:
+        x11.XFree(ctypes.cast(data, ctypes.c_void_p))
+
+
+def _prop32(dpy, win: int, name: str,
+            limit: int = PROP_MAX_ITEMS) -> list[int] | None:
+    atom = _atom(dpy, name, True)
+    if not atom:
+        return None
+    vals = _prop(dpy, win, atom, max_bytes=limit * 8)
+    return vals if isinstance(vals, list) else None
+
+
+def _prop_text(dpy, win: int, name: str) -> bytes | None:
+    atom = _atom(dpy, name, True)
+    if not atom:
+        return None
+    raw = _prop(dpy, win, atom)
+    return raw if isinstance(raw, bytes) else None
+
+
+def _decode_title(raw: bytes) -> str:
+    """WM_NAME 在老程序里可能是 latin-1：先严格 utf-8，再 latin-1。"""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", "replace")
+
+
+def _fetch_name(dpy, win: int) -> str | None:
+    name = ctypes.c_char_p()
+    try:
+        if x11.XFetchName(dpy, win, ctypes.byref(name)) and name.value:
+            return _decode_title(name.value)
+        return None
+    finally:
+        if name:
+            x11.XFree(ctypes.cast(name, ctypes.c_void_p))
+
+
+def _class_hint(dpy, win: int) -> tuple[str, str]:
+    hint = XClassHint()
+    cls = inst = ""
+    try:
+        if not x11.XGetClassHint(dpy, win, ctypes.byref(hint)):
+            return "", ""
+        if hint.res_name:
+            inst = ctypes.string_at(hint.res_name).decode("utf-8", "replace")
+        if hint.res_class:
+            cls = ctypes.string_at(hint.res_class).decode("utf-8", "replace")
+    finally:
+        for field in (hint.res_name, hint.res_class):
+            if field:
+                x11.XFree(ctypes.cast(field, ctypes.c_void_p))
+    return cls, inst
+
+
+def _window_info_raw(dpy, xid: int) -> WindowInfo | None:
+    if _attrs(dpy, xid) is None:
+        return None
+    title = ""
+    raw = _prop_text(dpy, xid, "_NET_WM_NAME")
+    if raw is not None:
+        title = raw.decode("utf-8", "replace")
+    else:
+        title = _fetch_name(dpy, xid) or ""
+    cls, instance = _class_hint(dpy, xid)
+    pids = _prop32(dpy, xid, "_NET_WM_PID", limit=1)
+    pid = pids[0] if pids else None
+    desktops = _prop32(dpy, xid, "_NET_WM_DESKTOP", limit=1)
+    desktop = desktops[0] if desktops else None
+    if desktop == 0xFFFFFFFF:        # "所有桌面"
+        desktop = None
+    if pid in (0, 0xFFFFFFFF):
+        pid = None
+    return WindowInfo(xid=xid, cls=cls, instance=instance, title=title,
+                      pid=pid, desktop=desktop)
+
+
+def _children(dpy, win: int) -> list[int]:
+    root_ret = ctypes.c_ulong(0)
+    parent_ret = ctypes.c_ulong(0)
+    children = P(ctypes.c_ulong)()
+    count = ctypes.c_uint(0)
+    try:
+        if not x11.XQueryTree(dpy, win, ctypes.byref(root_ret),
+                              ctypes.byref(parent_ret),
+                              ctypes.byref(children), ctypes.byref(count)):
+            return []
+        return [int(children[i]) for i in range(count.value)] if children else []
+    except Exception:
+        return []
+    finally:
+        if children:
+            x11.XFree(ctypes.cast(children, ctypes.c_void_p))
+
+
+def _parent_of(dpy, win: int) -> int | None:
+    root_ret = ctypes.c_ulong(0)
+    parent_ret = ctypes.c_ulong(0)
+    children = P(ctypes.c_ulong)()
+    count = ctypes.c_uint(0)
+    try:
+        if not x11.XQueryTree(dpy, win, ctypes.byref(root_ret),
+                              ctypes.byref(parent_ret),
+                              ctypes.byref(children), ctypes.byref(count)):
+            return None
+        return int(parent_ret.value) or None
+    except Exception:
+        return None
+    finally:
+        if children:
+            x11.XFree(ctypes.cast(children, ctypes.c_void_p))
+
+
+def _skip_window_type(dpy, xid: int) -> bool:
+    """菜单/提示框/桌面/面板不是键盘输入目标。"""
+    types = _prop32(dpy, xid, "_NET_WM_WINDOW_TYPE")
+    if not types:
+        return False
+    skip = {_atom(dpy, name) for name in SKIP_WINDOW_TYPES}
+    return any(t in skip and t != 0 for t in types)
+
+
+def _walk_clients(dpy, win: int, depth: int = 0) -> list[int]:
+    """XQueryTree 兜底枚举：viewable、非 override_redirect、有类名或标题。"""
+    if depth > 16:
+        return []
+    out: list[int] = []
+    for child in _children(dpy, win):
+        a = _attrs(dpy, child)
+        if a is None or a.override_redirect:
+            continue
+        if a.map_state == 2:                 # IsViewable
+            cls, inst = _class_hint(dpy, child)
+            if cls or inst or _prop_text(dpy, child, "_NET_WM_NAME"):
+                out.append(child)
+        out.extend(_walk_clients(dpy, child, depth + 1))
+    return out
+
+
+def list_windows_x11(dpy) -> list[WindowInfo]:
+    """EWMH `_NET_CLIENT_LIST` 优先，缺失时 XQueryTree 递归兜底。
+
+    返回顺序为叠放顺序（最上层在最后）。最小化窗口仍保留在 EWMH 列表里。
+    """
+    root = _root(dpy)
+    clients = _prop32(dpy, root, "_NET_CLIENT_LIST")
+    stacking = _prop32(dpy, root, "_NET_CLIENT_LIST_STACKING") or []
+    if not clients:
+        clients = _walk_clients(dpy, root)
+    order = {xid: i for i, xid in enumerate(stacking)}
+    out = []
+    for xid in clients:
+        if _skip_window_type(dpy, xid):
+            continue
+        info = _window_info_raw(dpy, xid)
+        if info and (info.cls or info.instance or info.title):
+            out.append(info)
+    out.sort(key=lambda w: order.get(w.xid, -1))
+    return out
+
+
+def _focus_raw(dpy) -> int | None:
+    win = ctypes.c_ulong(0)
+    rev = ctypes.c_int(0)
+    try:
+        x11.XGetInputFocus(dpy, ctypes.byref(win), ctypes.byref(rev))
+    except Exception:
+        return None
+    if win.value in (0, 1):              # None / PointerRoot
+        return None
+    return int(win.value)
+
+
+def focused_xid(dpy) -> int | None:
+    """当前焦点 xid；焦点在客户端子窗口时向上找有 WM_CLASS 的祖先。"""
+    xid = _focus_raw(dpy)
+    depth = 0
+    while xid and depth < FOCUS_WALK_LIMIT:
+        cls, inst = _class_hint(dpy, xid)
+        if cls or inst:
+            return xid
+        parent = _parent_of(dpy, xid)
+        if not parent or parent == xid:
+            break
+        xid = parent
+        depth += 1
+    return xid
+
+
+def active_window_x11(dpy) -> int | None:
+    """`_NET_ACTIVE_WINDOW` 优先，缺失时退回真实输入焦点。"""
+    vals = _prop32(dpy, _root(dpy), "_NET_ACTIVE_WINDOW", limit=1)
+    if vals and vals[0] not in (0, 1):
+        return int(vals[0])
+    return focused_xid(dpy)
+
+
+def parse_pattern(pat: str) -> tuple[str, str]:
+    for prefix in ("class:", "title:", "pid:", "id:", "re:"):
+        if pat.startswith(prefix):
+            return prefix[:-1], pat[len(prefix):]
+    return "any", pat
+
+
+def match_windows(wins: list[WindowInfo], pattern: str) -> list[WindowInfo]:
+    """默认大小写不敏感子串；`re:` 是唯一正则入口（显式 opt-in）。"""
+    kind, text = parse_pattern(pattern)
+    if kind == "id":
+        try:
+            xid = int(text, 0)
+        except ValueError:
+            raise Abort(f"--window id: 需要整数（十进制或 0x 十六进制）：{text!r}")
+        return [w for w in wins if w.xid == xid]
+    if kind == "pid":
+        try:
+            pid = int(text, 0)
+        except ValueError:
+            raise Abort(f"--window pid: 需要整数：{text!r}")
+        return [w for w in wins if w.pid == pid]
+    if kind == "re":
+        try:
+            rx = re.compile(text, re.IGNORECASE)
+        except re.error as e:
+            raise Abort(f"--window 正则无效（{pattern!r}）：{e}")
+        return [w for w in wins
+                if rx.search(f"{w.cls} {w.instance} {w.title}")]
+    needle = text.casefold()
+    nonempty = [w for w in wins if w.cls or w.instance or w.title]
+    if kind == "class":
+        return [w for w in nonempty
+                if needle in w.cls.casefold() or needle in w.instance.casefold()]
+    if kind == "title":
+        return [w for w in nonempty if needle in w.title.casefold()]
+    return [w for w in nonempty
+            if any(needle in (f or "").casefold()
+                   for f in (w.cls, w.instance, w.title))]
+
+
+def _xid(xid: int) -> str:
+    return f"0x{xid:08x}"
+
+
+def _sanitize(s: str) -> str:
+    """去掉会破坏 TSV / 终端转义的控制字符。"""
+    return "".join(" " if (ord(c) < 32 or ord(c) == 127) else c
+                   for c in (s or ""))
+
+
+def format_window_row(info: WindowInfo, active_xid: int | None = None) -> str:
+    """稳定、可 grep 的 TSV：id, class, pid, desktop, active, title。"""
+    return "\t".join([
+        _xid(info.xid),
+        _sanitize(info.cls or info.instance or "?"),
+        "-" if info.pid is None else str(info.pid),
+        "-" if info.desktop is None else str(info.desktop),
+        "*" if active_xid == info.xid else "-",
+        _sanitize(info.title),
+    ])
+
+
+WINDOW_HEADER = "ID\tCLASS\tPID\tDESKTOP\tACTIVE\tTITLE"
+
+
+def format_window_lines(wins: list[WindowInfo],
+                        active_xid: int | None = None) -> list[str]:
+    return [format_window_row(w, active_xid) for w in wins]
+
+
+def windows_as_json(wins: list[WindowInfo],
+                    active_xid: int | None = None) -> str:
+    rows = []
+    for w in wins:
+        row = w.as_dict()
+        row["id"] = _xid(w.xid)
+        row["active"] = w.xid == active_xid
+        rows.append(row)
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+def describe_window_info(info: WindowInfo | None) -> str:
+    if info is None:
+        return "未知窗口"
+    cls = info.cls or info.instance or "?"
+    title = " ".join((info.title or "").split())
+    if len(title) > 48:
+        title = title[:47] + "…"
+    base = f"[{cls}] {title}" if title else f"[{cls}]"
+    return f"{base} ({_xid(info.xid)})"
+
+
+def _format_candidate(index: int, info: WindowInfo) -> str:
+    cls = info.cls or info.instance or "?"
+    pid = "-" if info.pid is None else str(info.pid)
+    title = " ".join((info.title or "").split())
+    if len(title) > 48:
+        title = title[:47] + "…"
+    return f"  {index}) {_xid(info.xid)}  {cls:<16} {pid:>7}  {title}"
+
+
+def pick_window(matches: list[WindowInfo], *,
+                active_xid: int | None = None,
+                tty: bool = False) -> WindowInfo:
+    """在候选中确定唯一目标；歧义时宁可报错/让人选，绝不静默猜。"""
+    if not matches:
+        raise WindowUnavailable(
+            "没有匹配该 pattern 的窗口；用 --list-windows 查看候选，"
+            "或换一个更宽的 pattern。")
+    if len(matches) == 1:
+        return matches[0]
+    for w in matches:
+        if active_xid is not None and w.xid == active_xid:
+            sys.stderr.write(
+                f"匹配到 {len(matches)} 个窗口，使用当前激活的 "
+                f"{describe_window_info(w)}\n")
+            return w
+    ordered = list(reversed(matches))        # 最上层在前
+    listing = "\n".join(_format_candidate(i, w)
+                        for i, w in enumerate(ordered, 1))
+    if not tty:
+        raise WindowUnavailable(
+            f"匹配到 {len(matches)} 个窗口且当前不是交互终端：\n{listing}\n"
+            f"请改用 id:/pid:/更精确的 title: 指定目标。")
+    while True:
+        sys.stdout.write(f"匹配到 {len(matches)} 个窗口（最上层在前）：\n"
+                         f"{listing}\n"
+                         f"选择 [1-{len(ordered)}，回车=1，q=取消]: ")
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line == "":                       # EOF
+            raise WindowCancelled("已取消。")
+        choice = line.strip()
+        if choice.lower() in ("q", "quit"):
+            raise WindowCancelled("已取消。")
+        if choice == "":
+            return ordered[0]
+        try:
+            n = int(choice)
+        except ValueError:
+            continue
+        if 1 <= n <= len(ordered):
+            return ordered[n - 1]
+
+
+#: Xlib 默认错误处理器会 exit(1)：窗口在枚举与激活之间关闭时，
+#: 必须临时吞掉 BadWindow/BadMatch，否则"报错退出"变成"进程猝死"。
+_ERR_FUNC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+@_ERR_FUNC
+def _ignore_x_error(dpy, event):
+    return 0
+
+
+@contextlib.contextmanager
+def _x_trap(dpy):
+    # 全局引用必须由模块持有（_ignore_x_error 已由装饰器固定），否则回调野指针
+    old = x11.XSetErrorHandler(ctypes.cast(_ignore_x_error, ctypes.c_void_p))
+    try:
+        yield
+    finally:
+        try:
+            x11.XSync(dpy, False)
+        finally:
+            x11.XSetErrorHandler(old)
+
+
+def _client_message(win: int, message_type: int,
+                    values) -> XEvent:
+    ev = XEvent()
+    ev.xclient.type = X_CLIENT_MESSAGE
+    ev.xclient.serial = 0
+    ev.xclient.send_event = 1
+    ev.xclient.display = None
+    ev.xclient.window = win
+    ev.xclient.message_type = message_type
+    ev.xclient.format = 32
+    for i, v in enumerate(list(values)[:5]):
+        ev.xclient.data.l[i] = v
+    return ev
+
+
+def _is_focused(dpy, xid: int) -> bool:
+    """焦点等于 xid，或落在它的后代/重父化 frame 链上（≤32 层）。"""
+    focus = _focus_raw(dpy)
+    depth = 0
+    while focus and depth < FOCUS_WALK_LIMIT:
+        if focus == xid:
+            return True
+        parent = _parent_of(dpy, focus)
+        if not parent or parent == focus:
+            return False
+        focus = parent
+        depth += 1
+    return False
+
+
+def _wait_focus(dpy, xid: int, timeout: float,
+                interval: float = FOCUS_POLL_INTERVAL) -> bool:
+    end = time.time() + max(0.0, timeout)
+    while True:
+        if _is_focused(dpy, xid):
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(interval)
+
+
+def _same_window(cur: WindowInfo, expected: WindowInfo) -> bool:
+    """XID 复用检测：类名不一致就认为原窗口已关闭。"""
+    if expected.cls or expected.instance:
+        return (cur.cls, cur.instance) == (expected.cls, expected.instance)
+    return cur.title == expected.title
+
+
+def activate_window_x11(dpy, info: WindowInfo, *,
+                        timeout: float = WINDOW_ACTIVATE_TIMEOUT,
+                        interval: float = FOCUS_POLL_INTERVAL) -> bool:
+    """激活目标窗口并轮询确认焦点；失败抛 WindowUnavailable（不降级）。"""
+    cur = _window_info_raw(dpy, info.xid)
+    if cur is None:
+        raise WindowUnavailable(
+            f"窗口 {_xid(info.xid)} 已关闭；请重新 --list-windows。")
+    if not _same_window(cur, info):
+        raise WindowUnavailable(
+            f"{_xid(info.xid)} 已被另一个窗口复用（XID 复用），"
+            f"请重新 --list-windows。")
+    if _is_focused(dpy, info.xid):
+        return True
+
+    active = _atom(dpy, "_NET_ACTIVE_WINDOW", True)
+    if active:
+        ev = _client_message(info.xid, active, (2, 0, 0, 0, 0))
+        with _x_trap(dpy):
+            x11.XSendEvent(dpy, _root(dpy), False, SUBSTRUCT_MASK,
+                           ctypes.byref(ev))
+            x11.XFlush(dpy)
+        if _wait_focus(dpy, info.xid, timeout, interval):
+            return True
+
+    # 兜底：没有 EWMH / WM 忽略激活请求时直接 raise + set focus
+    with _x_trap(dpy):
+        x11.XRaiseWindow(dpy, info.xid)
+        x11.XSetInputFocus(dpy, info.xid, 2, 0)   # RevertToParent, CurrentTime
+        x11.XFlush(dpy)
+    if _wait_focus(dpy, info.xid, min(0.3, timeout), interval):
+        return True
+    raise WindowUnavailable(
+        f"无法把焦点切换到 {_xid(info.xid)} {describe_window_info(info)}。\n"
+        f"窗口管理器可能启用了焦点抢占防护（i3/sway 的 "
+        f"focus_on_window_activation、KWin 的焦点窃取防护、GNOME 的激活策略）。\n"
+        f"可选：1) 去掉 --window，改用 -s 3 手动切换；\n"
+        f"      2) 在 WM 设置里允许 activation；\n"
+        f"      3) 用 --window id:{_xid(info.xid)} 先确认窗口存在。")
 
 
 # ------------------------------------------------------------ 输入内容校验
@@ -306,7 +920,23 @@ class Backend:
                 "can_paste_mode": False, "unicode": False,
                 "needs_remap": False, "combos": False,
                 "per_char_delay": False, "daemon": False,
-                "escapes_supported": None}
+                "escapes_supported": None, "window_control": False}
+
+    def list_windows(self) -> list[WindowInfo]:
+        """能看到窗口列表的后端返回之；看不到就返回空列表（不抛）。"""
+        return []
+
+    def activate_window(self, info: WindowInfo, *,
+                        timeout: float = WINDOW_ACTIVATE_TIMEOUT) -> bool:
+        """激活并确认焦点；不能激活返回 False（由调用方报错，不静默）。"""
+        return False
+
+    def focused_window_id(self) -> int | None:
+        return None
+
+    def is_window_focused(self, xid: int) -> bool:
+        # 默认保守：不确定就当没焦点
+        return False
 
     def resolvable(self, text: str) -> list[str]:
         return []
@@ -483,12 +1113,25 @@ class X11Backend(Backend):
     def focus_info(self) -> dict | None:
         return focused_window(self.dpy)
 
+    def list_windows(self) -> list[WindowInfo]:
+        return list_windows_x11(self.dpy)
+
+    def activate_window(self, info: WindowInfo, *,
+                        timeout: float = WINDOW_ACTIVATE_TIMEOUT) -> bool:
+        return activate_window_x11(self.dpy, info, timeout=timeout)
+
+    def focused_window_id(self) -> int | None:
+        return active_window_x11(self.dpy)
+
+    def is_window_focused(self, xid: int) -> bool:
+        return _is_focused(self.dpy, xid)
+
     def capabilities(self) -> dict:
         return {"name": self.name, "can_focus_info": True,
                 "can_paste_mode": False, "unicode": True,
                 "needs_remap": True, "combos": True,
                 "per_char_delay": True, "daemon": False,
-                "escapes_supported": True}
+                "escapes_supported": True, "window_control": True}
 
     # ------------------------------------------------------------- 清理
     def close(self) -> None:
@@ -617,7 +1260,7 @@ class WtypeBackend(Backend):
                 "can_paste_mode": False, "unicode": True,
                 "needs_remap": False, "combos": True,
                 "per_char_delay": True, "daemon": False,
-                "escapes_supported": True}
+                "escapes_supported": True, "window_control": False}
 
 
 #: evdev keycode 表（ydotool key 用；只收常用键，未知键一律报错不猜）
@@ -814,7 +1457,8 @@ class YdotoolBackend(Backend):
                 "can_paste_mode": False, "unicode": False,
                 "needs_remap": False, "combos": True,
                 "per_char_delay": True, "daemon": True,
-                "escapes_supported": self.escapes_supported}
+                "escapes_supported": self.escapes_supported,
+                "window_control": False}
 
 
 # ------------------------------------------------------------- 后端选择
@@ -928,6 +1572,19 @@ class Typer:
     def capabilities(self) -> dict:
         return self.backend.capabilities()
 
+    def list_windows(self) -> list[WindowInfo]:
+        return self.backend.list_windows()
+
+    def activate_window(self, info: WindowInfo, *,
+                        timeout: float = WINDOW_ACTIVATE_TIMEOUT) -> bool:
+        return self.backend.activate_window(info, timeout=timeout)
+
+    def focused_window_id(self) -> int | None:
+        return self.backend.focused_window_id()
+
+    def is_window_focused(self, xid: int) -> bool:
+        return self.backend.is_window_focused(xid)
+
     def resolvable(self, text: str) -> list[str]:
         return self.backend.resolvable(text)
 
@@ -952,10 +1609,21 @@ def target_label(typer: Typer) -> str:
         return "未知窗口"
 
 
-def multiline_risk(typer: Typer, text: str) -> str | None:
-    """多行文本打进终端（或目标不可知）时的风险说明；无风险返回 None。"""
+def multiline_risk(typer: Typer, text: str,
+                   info: dict | None = None) -> str | None:
+    """多行文本打进终端（或目标不可知）时的风险说明；无风险返回 None。
+
+    ``info`` 是 `--window` 定向后的目标（dict 形式）；给定时按它判断，
+    不再看"当前焦点"——两者在激活后应一致，但目标信息更确定。
+    """
     body = text.rstrip("\n")
     if "\n" not in body:
+        return None
+    if info is not None:
+        if is_terminal(info):
+            n = len([line for line in body.splitlines() if line.strip()])
+            return (f"目标终端 {describe_window(info)}：多行文本会被逐行执行"
+                    f"（共 {n} 行）。")
         return None
     caps = typer.capabilities()
     if not caps.get("can_focus_info"):
@@ -1170,18 +1838,26 @@ class LineEditor:
 # ------------------------------------------------------------------ 交互界面
 class Settings:
     def __init__(self, sleep: float = 2.0, delay: float = 0.008,
-                 auto_enter: bool = False):
+                 auto_enter: bool = False, window: str | None = None):
         self.sleep = sleep
         self.delay = delay
         self.auto_enter = auto_enter
+        self.window = window
 
 
-def countdown(seconds: float, typer: Typer, cancelable: bool = True) -> bool:
-    """倒计时，顺手显示"会敲到哪个窗口"。返回 False 表示被取消。"""
-    try:
-        target = target_label(typer)
-    except Exception:
-        target = "未知窗口"
+def countdown(seconds: float, typer: Typer, cancelable: bool = True,
+              label: str | None = None) -> bool:
+    """倒计时，顺手显示"会敲到哪个窗口"。返回 False 表示被取消。
+
+    ``label`` 用于 `--window` 定向：显示的是**目标窗口**而不是当前焦点。
+    """
+    if label is None:
+        try:
+            target = target_label(typer)
+        except Exception:
+            target = "未知窗口"
+    else:
+        target = label
     if seconds <= 0:
         return True
     end = time.time() + seconds
@@ -1214,7 +1890,7 @@ def warn_multiline_target(typer: Typer, text: str) -> None:
 BANNER = """\
 autopaste REPL ── 回车后倒计时再输入；粘贴多行文本没有任何引号/转义问题
   :s 3 倒计时 | :d 0.02 每字间隔 | :nl 自动回车 | :k 组合键 | :f 文件
-  :r 重复上次 | :t 状态/目标窗口 | :h 帮助 | :q 退出
+  :r 重复上次 | :t 状态/目标窗口 | :w 定向窗口 | :h 帮助 | :q 退出
 """
 
 HELP = """\
@@ -1226,6 +1902,7 @@ HELP = """\
   :f <文件>       输入文件内容
   :r              重复上一次提交的内容
   :t              查看当前设置与目标窗口
+  :w <pattern>    设置定向窗口（class:/title:/pid:/re:），:w - 清除
   :h              显示本帮助
   :q              退出
 
@@ -1240,6 +1917,20 @@ def repl(typer: Typer, cfg: Settings) -> int:
     last: str | None = None
     sys.stdout.write(BANNER)
     sys.stdout.flush()
+
+    def activate() -> bool:
+        """REPL 里 --window 是粘性目标：每次提交前重新解析并激活。"""
+        if not cfg.window:
+            return True
+        try:
+            target = resolve_window(typer, cfg.window, tty=True)
+            if not typer.activate_window(target):
+                raise WindowUnavailable(
+                    f"无法激活 {describe_window_info(target)}")
+            return True
+        except Abort as e:
+            sys.stdout.write(f"  已拦截: {e}\n")
+            return False
 
     def cleanup():
         try:
@@ -1280,7 +1971,15 @@ def repl(typer: Typer, cfg: Settings) -> int:
                         sys.stdout.write(
                             f"  倒计时={cfg.sleep}s  字符间隔={cfg.delay}s  "
                             f"自动回车={'开' if cfg.auto_enter else '关'}\n"
+                            f"  定向窗口={cfg.window or '（当前焦点）'}\n"
                             f"  当前目标={target_label(typer)}\n")
+                    elif name == "w":
+                        if arg in ("-", ""):
+                            cfg.window = None
+                            sys.stdout.write("  已清除定向窗口\n")
+                        else:
+                            cfg.window = arg
+                            sys.stdout.write(f"  定向窗口={arg}\n")
                     elif name == "s":
                         cfg.sleep = _num(arg, 0.0, MAX_COUNTDOWN, "倒计时")
                     elif name == "d":
@@ -1292,7 +1991,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
                                          % ("开" if cfg.auto_enter else "关"))
                     elif name == "k":
                         validate_payload(arg)
-                        if countdown(cfg.sleep, typer):
+                        if activate() and countdown(cfg.sleep, typer):
                             typer.press(arg)
                     elif name == "f":
                         check_regular_file(arg)
@@ -1301,13 +2000,13 @@ def repl(typer: Typer, cfg: Settings) -> int:
                             body = f.read()
                         validate_payload(body)
                         warn_multiline_target(typer, body)
-                        if countdown(cfg.sleep, typer):
+                        if activate() and countdown(cfg.sleep, typer):
                             typer.type_text(body)
                         last = body
                     elif name == "r":
                         if last is None:
                             sys.stdout.write("  还没有可重复的内容\n")
-                        elif countdown(cfg.sleep, typer):
+                        elif activate() and countdown(cfg.sleep, typer):
                             typer.type_text(last)
                     elif name == "":
                         pass
@@ -1325,7 +2024,7 @@ def repl(typer: Typer, cfg: Settings) -> int:
                 continue
             last = text
             warn_multiline_target(typer, text)
-            if countdown(cfg.sleep, typer):
+            if activate() and countdown(cfg.sleep, typer):
                 typer.type_text(text)
                 if cfg.auto_enter:
                     typer.press("enter")
@@ -1351,6 +2050,27 @@ def _num(s: str, lo: float, hi: float, what: str) -> float:
 
 
 # ------------------------------------------------------------------ 命令行
+def resolve_window(typer: Typer, pattern: str, *, tty: bool) -> WindowInfo:
+    """把 --window pattern 解析成唯一目标；不支持定向的后端直接报错。"""
+    caps = typer.capabilities()
+    if not caps.get("window_control"):
+        raise WindowUnavailable(
+            f"当前后端 {caps.get('name')} 不支持窗口定向（Wayland 看不到 X11 窗口）。\n"
+            f"请改用 --backend x11（XWayland 窗口）或去掉 --window，"
+            f"用 -s 3 手动切换。")
+    wins = typer.list_windows()
+    matches = match_windows(wins, pattern)
+    return pick_window(matches, active_xid=typer.focused_window_id(),
+                       tty=tty)
+
+
+def _info_dict(info: WindowInfo | None) -> dict | None:
+    if info is None:
+        return None
+    return {"class": info.cls or None, "name": info.instance or None,
+            "title": info.title or None}
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="autopaste",
@@ -1397,6 +2117,13 @@ zsh 提示: 文本里的 ! 会被历史展开，请用单引号 '...' 包住，�
                     help="键盘注入后端：auto|x11|wtype|ydotool，默认 auto")
     ap.add_argument("--list-backends", action="store_true",
                     help="列出各后端可用性与探测依据后退出")
+    ap.add_argument("--window", metavar="PATTERN",
+                    help="定向到匹配的窗口：默认大小写不敏感子串（class/标题），"
+                         "可用 class: title: pid: id: re: 前缀")
+    ap.add_argument("--list-windows", action="store_true",
+                    help="列出可定向的窗口（TSV）后退出；可与 --window 过滤合用")
+    ap.add_argument("--json", action="store_true",
+                    help="配合 --list-windows 输出 JSON")
     ap.add_argument("--allow-root", action="store_true",
                     help="允许以 root 运行（不推荐）")
     ap.add_argument("-V", "--version", action="version",
@@ -1528,6 +2255,38 @@ def main(argv: list[str] | None = None) -> int:
             "如确有需要，请显式加 --allow-root。\n")
         return 2
 
+    # ---- --list-windows：只读枚举，不激活、不注入
+    if args.list_windows:
+        try:
+            typer = Typer(backend=args.backend)
+            try:
+                caps = typer.capabilities()
+                if not caps.get("window_control"):
+                    sys.stderr.write(
+                        f"当前后端 {caps.get('name')} 不支持窗口枚举"
+                        f"（Wayland 看不到 X11 窗口）。请用 --backend x11。\n")
+                    return 2
+                wins = typer.list_windows()
+                if args.window:
+                    wins = match_windows(wins, args.window)
+                active = typer.focused_window_id()
+                if args.json:
+                    sys.stdout.write(windows_as_json(wins, active) + "\n")
+                else:
+                    if sys.stdout.isatty():
+                        sys.stdout.write(WINDOW_HEADER + "\n")
+                    for line in format_window_lines(wins, active):
+                        sys.stdout.write(line + "\n")
+                return 0
+            finally:
+                typer.close()
+        except BackendUnavailable as e:
+            sys.stderr.write(f"{e}\n")
+            return 2
+        except Abort as e:
+            sys.stderr.write(f"已拦截: {e}\n")
+            return e.code
+
     try:
         delay = _num(str(args.delay), 0.0, MAX_DELAY, "字符间隔")
         sleep = 0.0 if args.sleep is None else _num(
@@ -1542,7 +2301,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if interactive:
             cfg = Settings(sleep=2.0 if args.sleep is None else sleep,
-                           delay=delay)
+                           delay=delay, window=args.window)
             typer = Typer(backend=args.backend, delay=cfg.delay)
             return repl(typer, cfg)
 
@@ -1573,11 +2332,25 @@ def main(argv: list[str] | None = None) -> int:
 
         typer = Typer(backend=args.backend, delay=delay)
 
+        # ---- --window：先解析目标（只读），激活留到确认之后
+        target = None
+        if args.window:
+            target = resolve_window(typer, args.window,
+                                    tty=sys.stdin.isatty())
+        target_info = _info_dict(target)
+        target_text = (f"[定向] {describe_window_info(target)}"
+                       if target else None)
+
         # ---- dry-run：只预览
         if args.dry_run:
             caps = typer.capabilities()
             sys.stdout.write(f"后端     : {caps.get('name')}\n")
-            sys.stdout.write(f"目标窗口 : {target_label(typer)}\n")
+            sys.stdout.write(f"目标窗口 : "
+                             f"{target_text or target_label(typer)}\n")
+            if target:
+                sys.stdout.write(
+                    "激活     : 将发送 _NET_ACTIVE_WINDOW"
+                    "（dry-run 未执行）\n")
             total = sum(len(k) for k in args.key)
             sys.stdout.write(f"字符数   : {total}\n")
             for i, item in enumerate(args.key, 1):
@@ -1601,15 +2374,35 @@ def main(argv: list[str] | None = None) -> int:
 
         # ---- 安全闸门 2: 终端里的多行文本（Wayland 下所有多行都要确认）
         joined = "".join(args.key)
-        risk = multiline_risk(typer, joined)
+        if target_info is not None:
+            risk = multiline_risk(typer, joined, info=target_info)
+        else:
+            risk = multiline_risk(typer, joined)
         if risk:
             sys.stderr.write(f"⚠  {risk}\n")
             if not args.yes and not _confirm("继续？"):
                 sys.stderr.write("已取消。\n")
                 return 3
 
-        if not countdown(sleep, typer):
+        # ---- 激活定向窗口（改焦点是副作用，放在确认之后）
+        if target is not None:
+            if not typer.activate_window(target):
+                raise WindowUnavailable(
+                    f"无法激活 {describe_window_info(target)}；"
+                    f"请确认窗口仍然存在。")
+
+        if target_text is not None:
+            ok = countdown(sleep, typer, label=target_text)
+        else:
+            ok = countdown(sleep, typer)
+        if not ok:
             return 130
+
+        # ---- 敲键前复核焦点：倒计时里用户可能点走了，绝不抢回
+        if target is not None and not typer.is_window_focused(target.xid):
+            sys.stderr.write(
+                "焦点已离开定向窗口，已取消（避免敲到别处）。\n")
+            return 3
 
         for item in args.key:
             if len(item) == 1 or not is_combo(item):
@@ -1620,6 +2413,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 typer.press(item)
         return 0
+    except (WindowUnavailable, WindowCancelled) as e:
+        sys.stderr.write(f"{e}\n")
+        return e.code
     except BackendUnavailable as e:
         sys.stderr.write(f"{e}\n")
         return 2
@@ -1628,7 +2424,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except Abort as e:
         sys.stderr.write(f"已拦截: {e}\n")
-        return 1
+        return e.code
     except KeyboardInterrupt:
         sys.stderr.write("\n已中断。\n")
         return 130
